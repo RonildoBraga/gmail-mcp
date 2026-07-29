@@ -3,3 +3,4 @@ google-auth>=2.28
 google-auth-oauthlib>=1.2
 google-api-python-client>=2.120
 cryptography>=42
+msal>=1.30

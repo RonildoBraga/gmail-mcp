@@ -1,23 +1,13 @@
-"""Gmail API helpers built on resolved per-account credentials.
+"""Gmail API response helpers -- pure functions over Gmail API payloads.
 
-Every entry point goes through `service_for(account)`, which is the single place
-account routing happens: resolve email -> credentials -> a Gmail service client.
+Service construction and account routing now live in providers.py / auth.py;
+this module is just the mapping logic the GmailProvider reuses.
 """
 
 from __future__ import annotations
 
 import base64
 from email.message import EmailMessage
-
-from googleapiclient.discovery import build
-
-from .auth import resolve
-
-
-def service_for(account: str | None):
-    """Return (email, Gmail service) for the given account (or the default)."""
-    email, creds = resolve(account)
-    return email, build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 def _header(headers: list[dict], name: str) -> str | None:
@@ -30,9 +20,7 @@ def _header(headers: list[dict], name: str) -> str | None:
 def thread_summary(svc, thread_id: str) -> dict:
     """Lightweight thread overview: subject/from/date + message count + snippet."""
     t = svc.users().threads().get(
-        userId="me",
-        id=thread_id,
-        format="metadata",
+        userId="me", id=thread_id, format="metadata",
         metadataHeaders=["From", "Subject", "Date"],
     ).execute()
     msgs = t.get("messages", [])
@@ -49,9 +37,7 @@ def thread_summary(svc, thread_id: str) -> dict:
 
 def _decode_part(part: dict) -> str:
     data = part.get("body", {}).get("data")
-    if not data:
-        return ""
-    return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+    return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace") if data else ""
 
 
 def _extract_body(payload: dict) -> str:
@@ -64,7 +50,6 @@ def _extract_body(payload: dict) -> str:
         plain = next((p for p in parts if p.get("mimeType") == "text/plain"), None)
         if plain:
             return _decode_part(plain)
-        # Recurse into nested multiparts; fall back to any text we can find.
         for p in parts:
             body = _extract_body(p)
             if body:
@@ -79,27 +64,28 @@ def render_thread(thread: dict) -> dict:
     messages = []
     for m in thread.get("messages", []):
         headers = m["payload"].get("headers", [])
-        messages.append(
-            {
-                "message_id": m["id"],
-                "from": _header(headers, "From"),
-                "to": _header(headers, "To"),
-                "subject": _header(headers, "Subject"),
-                "date": _header(headers, "Date"),
-                "snippet": m.get("snippet"),
-                "body": _extract_body(m["payload"]),
-                "label_ids": m.get("labelIds", []),
-            }
-        )
+        messages.append({
+            "message_id": m["id"],
+            "from": _header(headers, "From"),
+            "to": _header(headers, "To"),
+            "subject": _header(headers, "Subject"),
+            "date": _header(headers, "Date"),
+            "snippet": m.get("snippet"),
+            "body": _extract_body(m["payload"]),
+            "label_ids": m.get("labelIds", []),
+        })
     return {"thread_id": thread.get("id"), "messages": messages}
 
 
-def build_raw_message(*, to: str, subject: str, body: str, cc: str | None = None) -> str:
+def build_raw_message(*, to: str, subject: str, body: str,
+                      cc: str | None = None, bcc: str | None = None) -> str:
     """Compose an RFC-822 message and base64url-encode it for the Gmail API."""
     msg = EmailMessage()
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
     msg["Subject"] = subject
     msg.set_content(body)
     return base64.urlsafe_b64encode(msg.as_bytes()).decode()

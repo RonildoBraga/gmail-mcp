@@ -1,98 +1,91 @@
-# gmail-mcp — multi-account Gmail MCP server
+# gmail-mcp — multi-account, multi-provider mail MCP server
 
-A Gmail [MCP](https://modelcontextprotocol.io) server that supports **multiple
-Google accounts** at once. Every tool takes an optional `account` (email);
-omit it to use the default. `search_all_threads` fans out across all connected
-accounts in one call.
+An [MCP](https://modelcontextprotocol.io) mail server that connects **multiple
+accounts across providers** — **Google (Gmail)** and **Microsoft (Outlook/
+Hotmail)** — behind one uniform set of tools. Every tool takes an optional
+`account` (email); omit it to use the default. `search_all_threads` fans out
+across **all** connected accounts in one call, mixing Gmail and Outlook.
 
-The architecture in one line: OAuth is one-token-per-account, so this server
-keeps a **token store keyed by email** and routes each call to the right token,
-instead of holding a single global token.
+Architecture in one line: a **token store keyed by email + provider** routes
+each call to the right account, and a small **provider abstraction**
+(`providers.py`) dispatches Google calls to the Gmail API and Microsoft calls to
+Microsoft Graph — so the tools never fork per provider.
 
 ## Layout
 
 ```
 gmail-mcp/
 ├── gmail_mcp/
-│   ├── store.py    # SQLite token store, keyed by email; refresh tokens encrypted (Fernet)
-│   ├── auth.py     # OAuth consent flow (add_account) + resolve(account) -> live creds
-│   ├── gmail.py    # Gmail API helpers; service_for(account) is the one routing point
-│   ├── server.py   # FastMCP server; all tools
-│   └── __main__.py # `python -m gmail_mcp`
-├── credentials/    # client_secret.json (you add) + accounts.db + fernet.key (runtime). All gitignored.
+│   ├── config.py            # static config (Google scopes; Microsoft client id, authority, scopes)
+│   ├── store.py             # SQLite store keyed by email; provider + one Fernet-encrypted auth_data blob
+│   ├── auth.py              # Google OAuth + Microsoft MSAL device-code; per-provider credential refresh
+│   ├── providers.py         # MailProvider abstraction: provider_for() -> GmailProvider | GraphProvider
+│   ├── gmail.py             # Gmail API response helpers
+│   ├── graph.py             # Microsoft Graph mail helpers (stdlib urllib)
+│   ├── drive.py             # Google Drive helpers (Google accounts only)
+│   ├── server.py            # FastMCP server; all tools
+│   ├── connect_microsoft.py # `python -m gmail_mcp.connect_microsoft [key-email]`
+│   └── __main__.py          # `python -m gmail_mcp`
+├── credentials/             # client_secret.json (you add) + accounts.db + fernet.key (runtime). Gitignored.
 └── requirements.txt
 ```
 
 ## One-time setup
 
-### 1. Google Cloud OAuth client
+### Google (Gmail / Drive)
 
-1. [console.cloud.google.com](https://console.cloud.google.com) → create/select a project.
-2. **APIs & Services → Enable APIs** → enable **Gmail API**.
-3. **OAuth consent screen** → External → add yourself as a **Test user**
-   (test mode is fine; you don't need verification for personal use).
-4. **Credentials → Create Credentials → OAuth client ID → Desktop app**.
-5. Download the JSON, save it as `credentials/client_secret.json`.
+1. [console.cloud.google.com](https://console.cloud.google.com) → enable the **Gmail API** (and Drive API).
+2. **OAuth consent screen** → External → add yourself as a **Test user**.
+3. **Credentials → OAuth client ID → Desktop app** → download JSON → save as `credentials/client_secret.json`.
 
-The **Desktop app** client type matters — it enables the loopback redirect that
-`add_account` uses (`run_local_server`), so no redirect URI config is needed.
+The **Desktop app** type enables the loopback redirect `add_account` uses.
 
-### 2. Python env (pyenv-win + venv, per PYTHON_SETUP.md)
+### Microsoft (Outlook / Hotmail)
 
-```powershell
-cd C:\Users\ronildo\Developer\gmail-mcp
-pyenv local 3.13.13
+Uses an Entra **public client** app (device-code flow, no secret). The app id is
+already set in `config.py` (`MS_CLIENT_ID`). If you ever recreate it: register an
+app with **"Any Entra ID tenant + personal Microsoft accounts"**, enable
+**Allow public client flows**, and under **Authentication → Mobile & desktop**
+add the redirect URIs `https://login.microsoftonline.com/common/oauth2/nativeclient`
+**and** `https://login.live.com/oauth20_desktop.srf` (the second is required for
+personal accounts, or device login errors with `redirect_uri`).
+
+### Python env
+
+```bash
+cd ~/Developer/gmail-mcp
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ## Connecting accounts
 
-`add_account` is itself an MCP tool — but the first connect opens a browser for
-consent, so it's easiest to run it once from the shell before wiring the server
-into a client:
-
-```powershell
-.venv\Scripts\python.exe -c "from gmail_mcp import auth; print(auth.add_account())"
+**Google** — opens a browser for consent:
+```bash
+.venv/bin/python -c "from gmail_mcp import auth; print(auth.add_google_account())"
 ```
 
-A browser opens → pick the Google account → approve. The server reads the
-account's email from its Gmail profile and stores the tokens. Repeat for each
-account. The **first** account connected becomes the default.
-
-### If the wrong browser profile opens
-
-`add_account` opens your **default** browser, which may be the wrong Chrome
-profile (e.g. a work profile not signed into the account you want, or one whose
-account isn't a test user → `403 access_denied`). Use the URL-based helper
-instead — it prints the consent URL rather than opening a browser, so you can
-paste it into the exact profile signed into the right account:
-
-```powershell
-$env:PYTHONUNBUFFERED='1'; .venv\Scripts\python.exe -u connect_account.py
+**Microsoft** — device-code login (prints a URL + code to enter):
+```bash
+.venv/bin/python -m gmail_mcp.connect_microsoft
 ```
+> If the Microsoft account's **primary alias equals an existing Google
+> account's email**, pass the intended address so it stores separately and
+> doesn't collide, e.g. `python -m gmail_mcp.connect_microsoft you@outlook.com`.
 
-It prints `AUTHURL <url>`. Open that URL in the correct browser/profile, approve,
-and the loopback redirect completes the flow (prints `CONNECTED <email>`).
-
-> Testing-mode gotcha: the consent shows "Google hasn't verified this app"
-> (Advanced → Continue) and the Gmail permission must actually be granted — if
-> only the sign-in/email scope comes back, the connect fails with a scope error.
-> If a partial grant gets cached, revoke the app at
-> [myaccount.google.com permissions](https://myaccount.google.com/permissions)
-> and reconnect.
+The **first** account connected becomes the default.
 
 ## Wiring into an MCP client
 
-stdio server. Add to your MCP client config (e.g. Claude Code's `mcp` settings):
+stdio server:
 
 ```json
 {
   "mcpServers": {
     "gmail-multi": {
-      "command": "C:\\Users\\ronildo\\Developer\\gmail-mcp\\.venv\\Scripts\\python.exe",
+      "command": "/Users/ronildo/Developer/gmail-mcp/.venv/bin/python",
       "args": ["-m", "gmail_mcp"],
-      "cwd": "C:\\Users\\ronildo\\Developer\\gmail-mcp"
+      "cwd": "/Users/ronildo/Developer/gmail-mcp"
     }
   }
 }
@@ -100,34 +93,23 @@ stdio server. Add to your MCP client config (e.g. Claude Code's `mcp` settings):
 
 ## Tools
 
-| Tool | Purpose |
-|------|---------|
-| `add_account` | OAuth-connect a new Google account (opens browser) |
-| `list_accounts` | List connected accounts + which is default |
-| `set_default_account` | Choose the account used when `account` is omitted |
-| `remove_account` | Disconnect an account, delete its tokens |
-| `search_threads` | Search one account (Gmail query syntax) |
-| `get_thread` | Full thread: messages, headers, decoded bodies |
-| `search_all_threads` | **Cross-account** search across every connected account |
-| `list_labels` / `create_label` | Label management |
-| `label_thread` / `unlabel_thread` | Add/remove labels on a thread |
-| `create_draft` / `list_drafts` | Draft management |
+| Tool | Google | Microsoft |
+|------|:------:|:---------:|
+| `add_account` (Google) / `connect_microsoft` (CLI) | ✅ | ✅ |
+| `list_accounts` / `set_default_account` / `remove_account` | ✅ | ✅ |
+| `search_threads` / `get_thread` | ✅ | ✅ |
+| `search_all_threads` (cross-account, cross-provider) | ✅ | ✅ |
+| `create_draft` / `list_drafts` / `send_message` | ✅ | ✅ |
+| `list_labels` / `create_label` / `label_thread` / `unlabel_thread` | ✅ | ✖ (not yet) |
+| `drive_*` (list/search/read/create/move/rename/trash) | ✅ | ✖ (Google only) |
 
-Every Gmail tool accepts `account="you@example.com"`. Omit it to hit the default.
-
-## Scopes
-
-`gmail.modify` (read + labels + threads + drafts) plus `openid` + `userinfo.email`
-for account identity — see `auth.SCOPES`. Sending is intentionally **not**
-granted; add `gmail.send` and a send tool if you need it. Changing scopes
-requires re-running `add_account` for each account.
+Search syntax: Gmail uses Gmail query syntax (`is:unread from:a@b.com`);
+Microsoft treats the query as free-text `$search`.
 
 ## Security notes
 
-- Refresh tokens (long-lived) are **encrypted at rest** with Fernet; the key
-  lives in `credentials/fernet.key` (gitignored). Access tokens are short-lived
-  and stored plaintext.
-- `client_secret.json`, `accounts.db`, and `fernet.key` are all gitignored —
-  never commit them.
-- Back up `fernet.key` if you back up `accounts.db`: without the key the stored
-  refresh tokens are unrecoverable (you'd just re-run `add_account`).
+- Each account's credentials live in **one Fernet-encrypted `auth_data` blob**
+  (Google refresh token / MSAL token cache) — no secret material in the clear.
+- `client_secret.json`, `accounts.db`, `fernet.key` are gitignored — never commit.
+- Back up `fernet.key` alongside `accounts.db`; without the key the stored
+  credentials are unrecoverable (you'd just re-connect the accounts).

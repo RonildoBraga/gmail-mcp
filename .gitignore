@@ -6,3 +6,7 @@ __pycache__/
 credentials/client_secret.json
 credentials/accounts.db
 credentials/fernet.key
+
+# Build artifacts & local backups
+*.egg-info/
+backups/

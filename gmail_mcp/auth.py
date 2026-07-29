@@ -1,9 +1,9 @@
-"""OAuth consent flow and per-account credential resolution.
+"""Per-account auth for both providers.
 
-`add_account()` runs Google's installed-app (loopback) OAuth flow, reads the
-account's email from its Gmail profile, and stores the tokens. `resolve()` takes
-an optional account email, falls back to the default, refreshes the access token
-if stale, and returns live credentials.
+Google uses the installed-app OAuth loopback flow; Microsoft uses the MSAL
+device-code flow (no client secret -- it is a public client). `resolve_provider`
+returns (email, provider, auth_data); each provider's credential builder then
+refreshes and re-persists as needed.
 """
 
 from __future__ import annotations
@@ -11,25 +11,18 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+import msal
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from .config import GOOGLE_SCOPES, MS_AUTHORITY, MS_CLIENT_ID, MS_SCOPES
 from .store import CRED_DIR, AccountStore
 
 log = logging.getLogger("gmail_mcp.auth")
 
-# gmail.modify covers read + labels + threads + drafts (everything the original
-# single-account connector did). openid + userinfo.email make the consent return
-# the account identity. Add gmail.send here only if you implement a send tool.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-]
-
-CLIENT_SECRET_PATH = CRED_DIR / "client_secret.json"
+GOOGLE_CLIENT_SECRET_PATH = CRED_DIR / "client_secret.json"
 
 _store = AccountStore()
 
@@ -38,91 +31,125 @@ def store() -> AccountStore:
     return _store
 
 
-def _expiry_to_epoch(expiry: datetime | None) -> int | None:
-    """google-auth gives Credentials.expiry as a NAIVE UTC datetime. Tag it UTC
-    before converting so the epoch isn't offset by the local timezone (a naive
-    .timestamp() would assume local time)."""
-    if expiry is None:
-        return None
-    return int(expiry.replace(tzinfo=timezone.utc).timestamp())
-
-
-def _epoch_to_expiry(ts: int | None) -> datetime | None:
-    """Inverse of _expiry_to_epoch -> NAIVE UTC datetime, which is what
-    Credentials.expiry must be (it compares against a naive utcnow internally)."""
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
-
-
-def add_account() -> str:
-    """Run OAuth consent (opens a browser) and persist the account. Returns its email."""
-    if not CLIENT_SECRET_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing OAuth client secret at {CLIENT_SECRET_PATH}. Create an OAuth "
-            "'Desktop app' client in Google Cloud Console and save the JSON there."
-        )
-    flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_PATH), SCOPES)
-    # access_type=offline + prompt=consent => we reliably get a refresh token.
-    # authorization_prompt_message="" suppresses the stdout print that would
-    # otherwise corrupt the MCP stdio channel.
-    creds = flow.run_local_server(
-        port=0,
-        open_browser=True,
-        authorization_prompt_message="",
-        access_type="offline",
-        prompt="consent",
-    )
-    email = _email_for(creds)
-    _persist(email, creds)
-    log.info("Connected Gmail account %s", email)
-    return email
-
-
-def resolve(account: str | None) -> tuple[str, Credentials]:
-    """Return (email, live credentials) for `account`, or the default if None."""
+def resolve_provider(account: str | None) -> tuple[str, str, dict]:
+    """Return (email, provider, auth_data) for `account`, or the default account."""
     email = account or _store.get_default()
     if email is None:
-        raise ValueError("No account specified and no default configured. Call add_account first.")
+        raise ValueError("No account specified and no default configured. Connect one first.")
     rec = _store.get(email)
     if rec is None:
         raise ValueError(f"Unknown account {email!r}. Connected: {_store.list_emails()}")
+    return email, rec["provider"], rec["auth_data"]
 
+
+# ============================================================ Google (OAuth)
+def _expiry_to_epoch(expiry: datetime | None) -> int | None:
+    return None if expiry is None else int(expiry.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _epoch_to_expiry(ts: int | None) -> datetime | None:
+    return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
+
+
+def add_google_account() -> str:
+    """Run Google OAuth consent (opens a browser) and persist the account."""
+    if not GOOGLE_CLIENT_SECRET_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing OAuth client secret at {GOOGLE_CLIENT_SECRET_PATH}. Create a Google Cloud "
+            "'Desktop app' OAuth client and save the JSON there."
+        )
+    flow = InstalledAppFlow.from_client_secrets_file(str(GOOGLE_CLIENT_SECRET_PATH), GOOGLE_SCOPES)
+    creds = flow.run_local_server(
+        port=0, open_browser=True, authorization_prompt_message="",
+        access_type="offline", prompt="consent",
+    )
+    svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    email = svc.users().getProfile(userId="me").execute()["emailAddress"]
+    _store.upsert(email, "google", _google_auth_data(creds))
+    log.info("Connected Google account %s", email)
+    return email
+
+
+def _google_auth_data(creds: Credentials) -> dict:
+    return {
+        "access_token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes or GOOGLE_SCOPES),
+        "expiry": _expiry_to_epoch(creds.expiry),
+    }
+
+
+def google_credentials(email: str, auth: dict) -> Credentials:
+    """Build live Google credentials from stored auth_data, refreshing if stale."""
     creds = Credentials(
-        token=rec["access_token"],
-        refresh_token=rec["refresh_token"],
-        token_uri=rec["token_uri"],
-        client_id=rec["client_id"],
-        client_secret=rec["client_secret"],
-        scopes=rec["scopes"],
-        expiry=_epoch_to_expiry(rec["expiry"]),
+        token=auth["access_token"],
+        refresh_token=auth["refresh_token"],
+        token_uri=auth["token_uri"],
+        client_id=auth["client_id"],
+        client_secret=auth["client_secret"],
+        scopes=auth["scopes"],
+        expiry=_epoch_to_expiry(auth["expiry"]),
     )
     if not creds.valid:
         if not creds.refresh_token:
-            raise ValueError(f"Account {email!r} has no refresh token; re-run add_account.")
+            raise ValueError(f"Account {email!r} has no refresh token; re-connect it.")
         creds.refresh(Request())
-        _store.update_tokens(
-            email,
-            access_token=creds.token,
-            expiry=_expiry_to_epoch(creds.expiry),
-            refresh_token=creds.refresh_token,
+        _store.update_auth(email, _google_auth_data(creds))
+    return creds
+
+
+# ========================================================= Microsoft (MSAL)
+def _msal_app(cache: msal.SerializableTokenCache | None = None) -> msal.PublicClientApplication:
+    return msal.PublicClientApplication(MS_CLIENT_ID, authority=MS_AUTHORITY, token_cache=cache)
+
+
+def add_microsoft_account(on_prompt, key_email: str | None = None) -> str:
+    """Run the MSAL device-code flow. `on_prompt(message)` shows the user the
+    verification URL + code; this call then blocks until they finish signing in.
+    `key_email` overrides the stored account key -- use it when the Microsoft
+    account's primary alias collides with an existing Google account of the same
+    address (store the Microsoft account under its Outlook.com address instead)."""
+    cache = msal.SerializableTokenCache()
+    app = _msal_app(cache)
+    flow = app.initiate_device_flow(scopes=MS_SCOPES)
+    if "user_code" not in flow:
+        raise RuntimeError(f"Device flow failed to start: {flow.get('error_description', flow)}")
+    on_prompt(flow["message"])
+    result = app.acquire_token_by_device_flow(flow)  # blocks, polling
+    if "access_token" not in result:
+        raise RuntimeError(f"Sign-in failed: {result.get('error_description', result)}")
+    accounts = app.get_accounts()
+    email = key_email or (accounts[0]["username"] if accounts
+                          else result.get("id_token_claims", {}).get("preferred_username"))
+    if not email:
+        raise RuntimeError("Signed in but could not determine the account email.")
+    existing = _store.provider_of(email)
+    if existing is not None and existing != "microsoft":
+        raise RuntimeError(
+            f"An account {email!r} already exists as {existing}; refusing to overwrite it. "
+            f"Re-run with the intended address, e.g. "
+            f"`python -m gmail_mcp.connect_microsoft you@outlook.com`."
         )
-    return email, creds
+    _store.upsert(email, "microsoft", {"msal_cache": cache.serialize(), "scopes": MS_SCOPES})
+    log.info("Connected Microsoft account %s", email)
+    return email
 
 
-def _email_for(creds: Credentials) -> str:
-    profile = build("gmail", "v1", credentials=creds, cache_discovery=False)
-    return profile.users().getProfile(userId="me").execute()["emailAddress"]
-
-
-def _persist(email: str, creds: Credentials) -> None:
-    _store.upsert(
-        email,
-        access_token=creds.token,
-        refresh_token=creds.refresh_token,
-        token_uri=creds.token_uri,
-        client_id=creds.client_id,
-        client_secret=creds.client_secret,
-        scopes=list(creds.scopes or SCOPES),
-        expiry=_expiry_to_epoch(creds.expiry),
-    )
+def graph_token(email: str, auth: dict) -> str:
+    """Return a live Graph access token, refreshing silently and re-persisting the cache."""
+    cache = msal.SerializableTokenCache()
+    if auth.get("msal_cache"):
+        cache.deserialize(auth["msal_cache"])
+    app = _msal_app(cache)
+    accounts = app.get_accounts(username=email) or app.get_accounts()
+    if not accounts:
+        raise ValueError(f"No cached Microsoft session for {email!r}; re-connect it.")
+    result = app.acquire_token_silent(auth.get("scopes", MS_SCOPES), account=accounts[0])
+    if not result or "access_token" not in result:
+        raise ValueError(f"Could not silently refresh {email!r}; re-connect it.")
+    if cache.has_state_changed:
+        _store.update_auth(email, {**auth, "msal_cache": cache.serialize()})
+    return result["access_token"]

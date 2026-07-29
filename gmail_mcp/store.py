@@ -1,9 +1,16 @@
-"""SQLite-backed, per-account token store.
+"""SQLite-backed, per-account credential store (provider-agnostic).
 
-The whole point of multi-account is here: one row per Google account, keyed by
-email address, instead of a single global token. Refresh tokens are the
-long-lived credential, so they're encrypted at rest with Fernet; access tokens
-are short-lived and stored in the clear.
+One row per connected account, keyed by email. Each row carries a `provider`
+('google' | 'microsoft') and a single Fernet-encrypted `auth_data` JSON blob
+holding whatever that provider needs to mint live credentials:
+
+    google    -> {access_token, refresh_token, token_uri, client_id,
+                  client_secret, scopes, expiry}
+    microsoft -> {msal_cache, scopes}   # msal_cache is MSAL's serialized cache
+
+Encrypting the whole blob (not just the refresh token) keeps the schema tiny and
+means no secret material ever sits in the clear. A one-time migration upgrades
+the old Google-only schema in place, preserving connected accounts.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ KEY_PATH = CRED_DIR / "fernet.key"
 
 
 def _load_fernet() -> Fernet:
-    """Load (or first-time generate) the symmetric key used to encrypt refresh tokens."""
+    """Load (or first-time generate) the symmetric key that encrypts auth_data."""
     CRED_DIR.mkdir(exist_ok=True)
     if not KEY_PATH.exists():
         KEY_PATH.write_bytes(Fernet.generate_key())
@@ -28,7 +35,7 @@ def _load_fernet() -> Fernet:
 
 
 class AccountStore:
-    """Keyed token store. Thread-safe enough for a stdio MCP server (single conn)."""
+    """Keyed credential store. Single connection; fine for a stdio MCP server."""
 
     def __init__(self) -> None:
         CRED_DIR.mkdir(exist_ok=True)
@@ -38,100 +45,93 @@ class AccountStore:
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS accounts (
-                email          TEXT PRIMARY KEY,
-                access_token   TEXT,
-                refresh_token  BLOB,          -- Fernet-encrypted
-                token_uri      TEXT,
-                client_id      TEXT,
-                client_secret  TEXT,
-                scopes         TEXT,          -- JSON array
-                expiry         INTEGER,       -- epoch seconds, nullable
-                is_default     INTEGER DEFAULT 0
+                email      TEXT PRIMARY KEY,
+                provider   TEXT NOT NULL DEFAULT 'google',
+                auth_data  BLOB,          -- Fernet-encrypted JSON
+                is_default INTEGER DEFAULT 0
             )
             """
         )
         self._db.commit()
+        self._migrate_legacy()
 
-    # ---------------------------------------------------------------- writes
-    def upsert(
-        self,
-        email: str,
-        *,
-        access_token: str | None,
-        refresh_token: str | None,
-        token_uri: str | None,
-        client_id: str | None,
-        client_secret: str | None,
-        scopes: list[str],
-        expiry: int | None,
-    ) -> None:
+    # ------------------------------------------------------------- migration
+    def _columns(self, table: str) -> list[str]:
+        return [r[1] for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()]
+
+    def _migrate_legacy(self) -> None:
+        """Upgrade the old Google-only schema (token_uri column, plaintext access
+        token, separately-encrypted refresh token) to the unified blob schema."""
+        cols = self._columns("accounts")
+        if "token_uri" not in cols:
+            return  # already unified (or fresh)
+
+        legacy = self._db.execute("SELECT * FROM accounts").fetchall()
+        migrated: list[tuple[str, str, bytes, int]] = []
+        for row in legacy:
+            refresh = (
+                self._fernet.decrypt(row["refresh_token"]).decode()
+                if row["refresh_token"]
+                else None
+            )
+            auth = {
+                "access_token": row["access_token"],
+                "refresh_token": refresh,
+                "token_uri": row["token_uri"],
+                "client_id": row["client_id"],
+                "client_secret": row["client_secret"],
+                "scopes": json.loads(row["scopes"]) if row["scopes"] else [],
+                "expiry": row["expiry"],
+            }
+            blob = self._fernet.encrypt(json.dumps(auth).encode())
+            migrated.append((row["email"], "google", blob, row["is_default"]))
+
+        with self._db:
+            self._db.execute("ALTER TABLE accounts RENAME TO accounts_legacy")
+            self._db.execute(
+                """
+                CREATE TABLE accounts (
+                    email      TEXT PRIMARY KEY,
+                    provider   TEXT NOT NULL DEFAULT 'google',
+                    auth_data  BLOB,
+                    is_default INTEGER DEFAULT 0
+                )
+                """
+            )
+            self._db.executemany(
+                "INSERT INTO accounts (email, provider, auth_data, is_default) VALUES (?, ?, ?, ?)",
+                migrated,
+            )
+            self._db.execute("DROP TABLE accounts_legacy")
+
+    # ------------------------------------------------------------------ writes
+    def upsert(self, email: str, provider: str, auth_data: dict) -> None:
+        """Insert or replace an account's credentials. First account added becomes default."""
+        blob = self._fernet.encrypt(json.dumps(auth_data).encode())
         existing = self._db.execute(
-            "SELECT refresh_token, is_default FROM accounts WHERE email = ?", (email,)
+            "SELECT is_default FROM accounts WHERE email = ?", (email,)
         ).fetchone()
-
-        if refresh_token:
-            enc_refresh: bytes | None = self._fernet.encrypt(refresh_token.encode())
-        elif existing is not None:
-            # Google omits the refresh token on re-consent — keep the one we have.
-            enc_refresh = existing["refresh_token"]
-        else:
-            enc_refresh = None
-
-        # First account ever added becomes the default; otherwise preserve state.
-        if existing is not None:
-            is_default = existing["is_default"]
-        else:
-            is_default = 1 if self._count() == 0 else 0
-
+        is_default = existing["is_default"] if existing else (1 if self._count() == 0 else 0)
         with self._db:
             self._db.execute(
                 """
-                INSERT INTO accounts (email, access_token, refresh_token, token_uri,
-                                      client_id, client_secret, scopes, expiry, is_default)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(email) DO UPDATE SET
-                    access_token  = excluded.access_token,
-                    refresh_token = excluded.refresh_token,
-                    token_uri     = excluded.token_uri,
-                    client_id     = excluded.client_id,
-                    client_secret = excluded.client_secret,
-                    scopes        = excluded.scopes,
-                    expiry        = excluded.expiry
+                INSERT INTO accounts (email, provider, auth_data, is_default)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET provider=excluded.provider,
+                                                 auth_data=excluded.auth_data
                 """,
-                (
-                    email,
-                    access_token,
-                    enc_refresh,
-                    token_uri,
-                    client_id,
-                    client_secret,
-                    json.dumps(scopes),
-                    expiry,
-                    is_default,
-                ),
+                (email, provider, blob, is_default),
             )
 
-    def update_tokens(
-        self, email: str, *, access_token: str, expiry: int | None, refresh_token: str | None = None
-    ) -> None:
-        """Persist a rotated access token (and refresh token, if Google rotated it)."""
+    def update_auth(self, email: str, auth_data: dict) -> None:
+        """Persist refreshed credentials (rotated token, updated MSAL cache, ...)."""
+        blob = self._fernet.encrypt(json.dumps(auth_data).encode())
         with self._db:
-            if refresh_token:
-                enc = self._fernet.encrypt(refresh_token.encode())
-                self._db.execute(
-                    "UPDATE accounts SET access_token=?, expiry=?, refresh_token=? WHERE email=?",
-                    (access_token, expiry, enc, email),
-                )
-            else:
-                self._db.execute(
-                    "UPDATE accounts SET access_token=?, expiry=? WHERE email=?",
-                    (access_token, expiry, email),
-                )
+            self._db.execute("UPDATE accounts SET auth_data=? WHERE email=?", (blob, email))
 
     def remove(self, email: str) -> bool:
         with self._db:
             removed = self._db.execute("DELETE FROM accounts WHERE email=?", (email,)).rowcount > 0
-        # If we deleted the default, promote whatever's left.
         if removed and self.get_default() is None:
             remaining = self.list_emails()
             if remaining:
@@ -145,32 +145,35 @@ class AccountStore:
             self._db.execute("UPDATE accounts SET is_default=0")
             self._db.execute("UPDATE accounts SET is_default=1 WHERE email=?", (email,))
 
-    # ---------------------------------------------------------------- reads
+    # ------------------------------------------------------------------- reads
     def get(self, email: str) -> dict | None:
         row = self._db.execute("SELECT * FROM accounts WHERE email=?", (email,)).fetchone()
-        return self._row_to_dict(row) if row else None
+        if row is None:
+            return None
+        return {
+            "email": row["email"],
+            "provider": row["provider"],
+            "auth_data": json.loads(self._fernet.decrypt(row["auth_data"]).decode()),
+            "is_default": bool(row["is_default"]),
+        }
+
+    def provider_of(self, email: str) -> str | None:
+        row = self._db.execute("SELECT provider FROM accounts WHERE email=?", (email,)).fetchone()
+        return row["provider"] if row else None
 
     def list_emails(self) -> list[str]:
         return [r["email"] for r in self._db.execute("SELECT email FROM accounts ORDER BY email")]
+
+    def list_accounts(self) -> list[dict]:
+        return [
+            {"email": r["email"], "provider": r["provider"]}
+            for r in self._db.execute("SELECT email, provider FROM accounts ORDER BY email")
+        ]
 
     def get_default(self) -> str | None:
         row = self._db.execute("SELECT email FROM accounts WHERE is_default=1 LIMIT 1").fetchone()
         return row["email"] if row else None
 
-    # ---------------------------------------------------------------- internals
+    # --------------------------------------------------------------- internals
     def _count(self) -> int:
         return self._db.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
-
-    def _row_to_dict(self, row: sqlite3.Row) -> dict:
-        refresh = self._fernet.decrypt(row["refresh_token"]).decode() if row["refresh_token"] else None
-        return {
-            "email": row["email"],
-            "access_token": row["access_token"],
-            "refresh_token": refresh,
-            "token_uri": row["token_uri"],
-            "client_id": row["client_id"],
-            "client_secret": row["client_secret"],
-            "scopes": json.loads(row["scopes"]) if row["scopes"] else [],
-            "expiry": row["expiry"],
-            "is_default": bool(row["is_default"]),
-        }

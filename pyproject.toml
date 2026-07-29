@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmail-mcp"
+version = "0.2.0"
+description = "Multi-account Gmail MCP server (read, send, modify, labels, drafts)"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp>=1.2.0",
+    "google-auth>=2.28",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.120",
+    "cryptography>=42",
+]
+
+[project.scripts]
+gmail-mcp = "gmail_mcp.server:main"
+
+[tool.setuptools]
+packages = ["gmail_mcp"]
