@@ -124,3 +124,55 @@ def create_draft(token: str, to: str, subject: str, body: str, cc=None, bcc=None
 def list_drafts(token: str, top: int) -> list[dict]:
     path = f"/me/mailFolders/drafts/messages?$top={top}&$select=id,subject,toRecipients,receivedDateTime"
     return _request(token, "GET", path).get("value", [])
+
+
+_WELL_KNOWN_FOLDERS = {
+    "archive", "inbox", "junkemail", "deleteditems", "drafts", "sentitems",
+}
+
+
+def _conversation_message_ids(token: str, conversation_id: str) -> list[str]:
+    """Every message id in a conversation, across all folders."""
+    cid = urllib.parse.quote(conversation_id)
+    path = f"/me/messages?$filter=conversationId eq '{cid}'&$select=id"
+    return [m["id"] for m in _request(token, "GET", path).get("value", [])]
+
+
+def resolve_folder(token: str, name: str, create: bool = False) -> str:
+    """Resolve a destination folder to a Graph destinationId.
+
+    A well-known name (archive, junkemail, deleteditems, inbox, ...) is accepted
+    verbatim -- Graph treats those as valid destinationIds. Otherwise the mailbox
+    is searched for a top-level folder with that display name, optionally creating
+    it. Custom folders are used (not the built-in "Junk Email"/"Deleted Items")
+    when we want mail that won't be auto-purged.
+    """
+    key = name.strip().lower().replace(" ", "")
+    if key in _WELL_KNOWN_FOLDERS:
+        return key
+    q = urllib.parse.quote(f"displayName eq '{name}'")
+    found = _request(token, "GET", f"/me/mailFolders?$filter={q}").get("value", [])
+    if found:
+        return found[0]["id"]
+    if create:
+        return _request(token, "POST", "/me/mailFolders", {"displayName": name})["id"]
+    raise RuntimeError(f"Outlook folder {name!r} not found (create=False)")
+
+
+def move_thread(token: str, conversation_id: str, folder: str, create: bool = True) -> dict:
+    """Move every message in a conversation to `folder` (well-known or custom)."""
+    dest = resolve_folder(token, folder, create=create)
+    ids = _conversation_message_ids(token, conversation_id)
+    for mid in ids:
+        _request(token, "POST", f"/me/messages/{urllib.parse.quote(mid)}/move",
+                 {"destinationId": dest})
+    return {"thread_id": conversation_id, "moved": len(ids), "destination": folder}
+
+
+def list_folders(token: str) -> list[dict]:
+    """Top-level mail folders with their item counts."""
+    path = "/me/mailFolders?$top=100&$select=id,displayName,totalItemCount"
+    return [
+        {"id": f["id"], "name": f.get("displayName"), "count": f.get("totalItemCount")}
+        for f in _request(token, "GET", path).get("value", [])
+    ]

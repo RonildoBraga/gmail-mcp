@@ -100,8 +100,15 @@ stdio server:
 | `search_threads` / `get_thread` | ✅ | ✅ |
 | `search_all_threads` (cross-account, cross-provider) | ✅ | ✅ |
 | `create_draft` / `list_drafts` / `send_message` | ✅ | ✅ |
+| `archive_thread` / `move_thread` / `list_folders` | ✅ | ✅ |
 | `list_labels` / `create_label` / `label_thread` / `unlabel_thread` | ✅ | ✖ (not yet) |
 | `drive_*` (list/search/read/create/move/rename/trash) | ✅ | ✖ (Google only) |
+
+`archive_thread` / `move_thread` unify filing across providers: Gmail moves
+labels (remove `INBOX`; a folder name maps to a label), Outlook moves the
+conversation between mail folders (well-known `Archive` / `Junk Email` /
+`Deleted Items`, or a custom folder created on demand). Prefer a custom folder
+over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
 
 Search syntax: Gmail uses Gmail query syntax (`is:unread from:a@b.com`);
 Microsoft treats the query as free-text `$search`.

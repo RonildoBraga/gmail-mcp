@@ -116,6 +116,31 @@ def unlabel_thread(thread_id: str, label_ids: list[str], account: str | None = N
     return provider_for(account).modify_labels(thread_id, add=[], remove=label_ids)
 
 
+# =================================================================== organise
+@mcp.tool()
+def archive_thread(thread_id: str, account: str | None = None) -> dict:
+    """Take a thread out of the inbox but keep it. Works for both providers:
+    Gmail removes the INBOX label (stays in All Mail); Outlook moves it to the
+    Archive folder. Nothing is deleted."""
+    return provider_for(account).archive_thread(thread_id)
+
+
+@mcp.tool()
+def move_thread(thread_id: str, folder: str, account: str | None = None) -> dict:
+    """File a thread into `folder`, out of the inbox. Works for both providers.
+    Outlook: a well-known folder (Archive, Junk Email, Deleted Items) or a custom
+    folder, created on demand -- prefer a custom folder (e.g. "Junk", "Finance")
+    over the built-in "Junk Email"/"Deleted Items", which auto-purge. Gmail: a
+    label of that name (created if missing), and INBOX is removed."""
+    return provider_for(account).move_thread(thread_id, folder)
+
+
+@mcp.tool()
+def list_folders(account: str | None = None) -> dict:
+    """List folders (Outlook) or labels (Gmail) in an account."""
+    return provider_for(account).list_folders()
+
+
 # ===================================================================== drafts
 @mcp.tool()
 def create_draft(to: str, subject: str, body: str, cc: str | None = None,

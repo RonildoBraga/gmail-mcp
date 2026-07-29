@@ -44,6 +44,26 @@ class GmailProvider:
         ).execute()
         return {"account": self.email, "thread_id": thread_id, "added": add, "removed": remove}
 
+    def archive_thread(self, thread_id: str) -> dict:
+        """Take a thread out of the inbox (remove the INBOX label); it stays in All Mail."""
+        return self.modify_labels(thread_id, add=[], remove=["INBOX"])
+
+    def _label_id(self, name: str) -> str:
+        for l in self.svc.users().labels().list(userId="me").execute().get("labels", []):
+            if l["name"].lower() == name.lower():
+                return l["id"]
+        return self.svc.users().labels().create(userId="me", body={"name": name}).execute()["id"]
+
+    def move_thread(self, thread_id: str, folder: str) -> dict:
+        """File a thread under a label named `folder` and remove it from the inbox
+        ("archive" just removes INBOX). Mirrors Outlook's move-to-folder."""
+        if folder.strip().lower() in ("archive", ""):
+            return self.archive_thread(thread_id)
+        return self.modify_labels(thread_id, add=[self._label_id(folder)], remove=["INBOX"])
+
+    def list_folders(self) -> dict:
+        return {"account": self.email, "folders": self.list_labels()["labels"]}
+
     def create_draft(self, to, subject, body, cc, bcc) -> dict:
         raw = gmail.build_raw_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
         draft = self.svc.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
@@ -91,6 +111,17 @@ class GraphProvider:
 
     def modify_labels(self, thread_id: str, add: list[str], remove: list[str]) -> dict:
         raise ValueError(_MS_NO_LABELS)
+
+    def archive_thread(self, thread_id: str) -> dict:
+        """Move a conversation to the Outlook Archive folder (keeps it, out of inbox)."""
+        return {"account": self.email, **graph.move_thread(self.token, thread_id, "archive")}
+
+    def move_thread(self, thread_id: str, folder: str) -> dict:
+        """Move a conversation into `folder` (well-known name or a custom folder, created on demand)."""
+        return {"account": self.email, **graph.move_thread(self.token, thread_id, folder)}
+
+    def list_folders(self) -> dict:
+        return {"account": self.email, "folders": graph.list_folders(self.token)}
 
 
 def provider_for(account: str | None):
