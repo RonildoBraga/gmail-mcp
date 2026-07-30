@@ -23,4 +23,4 @@ MS_CLIENT_ID = "37784185-cdeb-4495-a5c7-babfa27a42d3"
 MS_AUTHORITY = "https://login.microsoftonline.com/common"
 # Delegated scopes; the user consents to these once at first device-code login.
 # offline_access (=> refresh token) is added by MSAL automatically.
-MS_SCOPES = ["Mail.ReadWrite", "Mail.Send", "User.Read"]
+MS_SCOPES = ["Mail.ReadWrite", "Mail.Send", "MailboxSettings.ReadWrite", "User.Read"]
