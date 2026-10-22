@@ -9,6 +9,7 @@ refreshes and re-persists as needed.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 
 import msal
@@ -24,22 +25,30 @@ log = logging.getLogger("gmail_mcp.auth")
 
 GOOGLE_CLIENT_SECRET_PATH = CRED_DIR / "client_secret.json"
 
-_store = AccountStore()
+_store: AccountStore | None = None
+_store_lock = threading.Lock()
 
 
 def store() -> AccountStore:
+    # Importing tools must not create a database/key or touch live credentials.
+    global _store
+    if _store is None:
+        with _store_lock:
+            if _store is None:
+                _store = AccountStore()
     return _store
 
 
 def resolve_provider(account: str | None) -> tuple[str, str, dict]:
     """Return (email, provider, auth_data) for `account`, or the default account."""
-    email = account or _store.get_default()
+    s = store()
+    email = account or s.get_default()
     if email is None:
         raise ValueError("No account specified and no default configured. Connect one first.")
-    rec = _store.get(email)
+    rec = s.get(email)
     if rec is None:
-        raise ValueError(f"Unknown account {email!r}. Connected: {_store.list_emails()}")
-    return email, rec["provider"], rec["auth_data"]
+        raise ValueError(f"Unknown account {email!r}. Connected: {s.list_emails()}")
+    return rec["email"], rec["provider"], rec["auth_data"]
 
 
 # ============================================================ Google (OAuth)
@@ -65,19 +74,22 @@ def add_google_account() -> str:
     )
     svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
     email = svc.users().getProfile(userId="me").execute()["emailAddress"]
-    _store.upsert(email, "google", _google_auth_data(creds))
+    store().upsert(email, "google", _google_auth_data(creds))
     log.info("Connected Google account %s", email)
     return email
 
 
 def _google_auth_data(creds: Credentials) -> dict:
+    # An absent scope list means the existing grant, not the current configured
+    # consent scopes. Refreshing legacy credentials must never invent grants.
+    scopes = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
     return {
         "access_token": creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri": creds.token_uri,
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes or GOOGLE_SCOPES),
+        "scopes": list(scopes or []),
         "expiry": _expiry_to_epoch(creds.expiry),
     }
 
@@ -97,7 +109,7 @@ def google_credentials(email: str, auth: dict) -> Credentials:
         if not creds.refresh_token:
             raise ValueError(f"Account {email!r} has no refresh token; re-connect it.")
         creds.refresh(Request())
-        _store.update_auth(email, _google_auth_data(creds))
+        store().update_auth(email, _google_auth_data(creds))
     return creds
 
 
@@ -122,20 +134,33 @@ def add_microsoft_account(on_prompt, key_email: str | None = None) -> str:
     if "access_token" not in result:
         raise RuntimeError(f"Sign-in failed: {result.get('error_description', result)}")
     accounts = app.get_accounts()
-    email = key_email or (accounts[0]["username"] if accounts
-                          else result.get("id_token_claims", {}).get("preferred_username"))
+    preferred = result.get("id_token_claims", {}).get("preferred_username", "")
+    selected = _select_microsoft_account(accounts, key_email or preferred, None)
+    email = key_email or selected.get("username") or preferred
     if not email:
         raise RuntimeError("Signed in but could not determine the account email.")
-    existing = _store.provider_of(email)
-    if existing is not None and existing != "microsoft":
-        raise RuntimeError(
-            f"An account {email!r} already exists as {existing}; refusing to overwrite it. "
-            f"Re-run with the intended address, e.g. "
-            f"`python -m gmail_mcp.connect_microsoft you@outlook.com`."
-        )
-    _store.upsert(email, "microsoft", {"msal_cache": cache.serialize(), "scopes": MS_SCOPES})
+    store().upsert(email, "microsoft", {
+        "msal_cache": cache.serialize(), "scopes": list(MS_SCOPES),
+        "home_account_id": selected["home_account_id"],
+    })
     log.info("Connected Microsoft account %s", email)
     return email
+
+
+def _select_microsoft_account(accounts: list[dict], email: str, home_account_id: str | None) -> dict:
+    """Select a bound identity; preserve legacy aliases only for a sole cache account."""
+    if home_account_id:
+        matches = [a for a in accounts if a.get("home_account_id") == home_account_id]
+    else:
+        matches = [a for a in accounts if a.get("username", "").casefold() == email.casefold()]
+        if not matches and len(accounts) == 1:
+            matches = accounts  # Old key_email aliases did not record a stable ID.
+    if len(matches) != 1 or not matches[0].get("home_account_id"):
+        raise ValueError(
+            f"No unambiguous cached Microsoft identity for {email!r}; re-connect this account. "
+            "Refusing to use another cached account."
+        )
+    return matches[0]
 
 
 def graph_token(email: str, auth: dict) -> str:
@@ -144,12 +169,15 @@ def graph_token(email: str, auth: dict) -> str:
     if auth.get("msal_cache"):
         cache.deserialize(auth["msal_cache"])
     app = _msal_app(cache)
-    accounts = app.get_accounts(username=email) or app.get_accounts()
-    if not accounts:
-        raise ValueError(f"No cached Microsoft session for {email!r}; re-connect it.")
-    result = app.acquire_token_silent(auth.get("scopes", MS_SCOPES), account=accounts[0])
+    account = _select_microsoft_account(app.get_accounts(), email, auth.get("home_account_id"))
+    scopes = auth.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        raise ValueError(f"Missing stored Microsoft scopes for {email!r}; re-connect this account.")
+    result = app.acquire_token_silent(scopes, account=account)
     if not result or "access_token" not in result:
         raise ValueError(f"Could not silently refresh {email!r}; re-connect it.")
-    if cache.has_state_changed:
-        _store.update_auth(email, {**auth, "msal_cache": cache.serialize()})
+    if cache.has_state_changed or auth.get("home_account_id") != account["home_account_id"]:
+        store().update_auth(email, {
+            **auth, "msal_cache": cache.serialize(), "home_account_id": account["home_account_id"],
+        })
     return result["access_token"]

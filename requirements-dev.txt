@@ -1,0 +1,3 @@
+-r requirements.lock.txt
+build==1.6.1
+ruff==0.17.1

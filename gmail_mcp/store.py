@@ -6,7 +6,7 @@ holding whatever that provider needs to mint live credentials:
 
     google    -> {access_token, refresh_token, token_uri, client_id,
                   client_secret, scopes, expiry}
-    microsoft -> {msal_cache, scopes}   # msal_cache is MSAL's serialized cache
+    microsoft -> {msal_cache, scopes, home_account_id}
 
 Encrypting the whole blob (not just the refresh token) keeps the schema tiny and
 means no secret material ever sits in the clear. A one-time migration upgrades
@@ -106,11 +106,34 @@ class AccountStore:
 
     # ------------------------------------------------------------------ writes
     def upsert(self, email: str, provider: str, auth_data: dict) -> None:
-        """Insert or replace an account's credentials. First account added becomes default."""
+        """Refresh a matching account; never overwrite a different provider/identity.
+
+        Email selectors and the on-disk schema stay compatible. A Microsoft
+        alias may be used as a distinct key when providers share an address.
+        """
+        if provider not in {"google", "microsoft"} or not email.strip():
+            raise ValueError("An email selector and a supported provider are required.")
+        matches = self._db.execute(
+            "SELECT * FROM accounts WHERE email = ? COLLATE NOCASE", (email,)
+        ).fetchall()
+        if any(row["provider"] != provider for row in matches):
+            raise ValueError(
+                f"Account {email!r} already belongs to another provider; refusing to overwrite it. "
+                "Use a distinct Microsoft alias/account selector."
+            )
+        if len(matches) > 1:
+            raise ValueError(f"Account {email!r} has ambiguous case variants; use distinct selectors.")
+        existing = matches[0] if matches else None
+        if existing:
+            email = existing["email"]  # Keep the established selector and default.
+            previous = json.loads(self._fernet.decrypt(existing["auth_data"]).decode())
+            identity = previous.get("home_account_id")
+            if provider == "microsoft" and identity and auth_data.get("home_account_id") != identity:
+                raise ValueError(
+                    f"Account {email!r} is bound to a different Microsoft identity; "
+                    "refusing to replace its credentials. Use a distinct account selector."
+                )
         blob = self._fernet.encrypt(json.dumps(auth_data).encode())
-        existing = self._db.execute(
-            "SELECT is_default FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
         is_default = existing["is_default"] if existing else (1 if self._count() == 0 else 0)
         with self._db:
             self._db.execute(
@@ -125,11 +148,19 @@ class AccountStore:
 
     def update_auth(self, email: str, auth_data: dict) -> None:
         """Persist refreshed credentials (rotated token, updated MSAL cache, ...)."""
+        row = self._account_row(email)
+        if row is None:
+            raise KeyError(email)
+        email = row["email"]
         blob = self._fernet.encrypt(json.dumps(auth_data).encode())
         with self._db:
             self._db.execute("UPDATE accounts SET auth_data=? WHERE email=?", (blob, email))
 
     def remove(self, email: str) -> bool:
+        row = self._account_row(email)
+        if row is None:
+            return False
+        email = row["email"]
         with self._db:
             removed = self._db.execute("DELETE FROM accounts WHERE email=?", (email,)).rowcount > 0
         if removed and self.get_default() is None:
@@ -139,15 +170,17 @@ class AccountStore:
         return removed
 
     def set_default(self, email: str) -> None:
-        if self._db.execute("SELECT 1 FROM accounts WHERE email=?", (email,)).fetchone() is None:
+        row = self._account_row(email)
+        if row is None:
             raise KeyError(email)
+        email = row["email"]
         with self._db:
             self._db.execute("UPDATE accounts SET is_default=0")
             self._db.execute("UPDATE accounts SET is_default=1 WHERE email=?", (email,))
 
     # ------------------------------------------------------------------- reads
     def get(self, email: str) -> dict | None:
-        row = self._db.execute("SELECT * FROM accounts WHERE email=?", (email,)).fetchone()
+        row = self._account_row(email)
         if row is None:
             return None
         return {
@@ -158,7 +191,7 @@ class AccountStore:
         }
 
     def provider_of(self, email: str) -> str | None:
-        row = self._db.execute("SELECT provider FROM accounts WHERE email=?", (email,)).fetchone()
+        row = self._account_row(email)
         return row["provider"] if row else None
 
     def list_emails(self) -> list[str]:
@@ -175,5 +208,18 @@ class AccountStore:
         return row["email"] if row else None
 
     # --------------------------------------------------------------- internals
+    def _account_row(self, email: str) -> sqlite3.Row | None:
+        # Exact selectors preserve legacy rows; case-insensitive fallback is
+        # accepted only if unique, so it can never silently switch accounts.
+        row = self._db.execute("SELECT * FROM accounts WHERE email=?", (email,)).fetchone()
+        if row is not None:
+            return row
+        rows = self._db.execute(
+            "SELECT * FROM accounts WHERE email=? COLLATE NOCASE", (email,)
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Ambiguous account selector {email!r}; use its exact stored case.")
+        return rows[0] if rows else None
+
     def _count(self) -> int:
         return self._db.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]

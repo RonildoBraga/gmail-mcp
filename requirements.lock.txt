@@ -22,6 +22,7 @@ idna==3.18
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mcp==1.27.2
+msal==1.39.0
 oauthlib==3.3.1
 proto-plus==1.28.0
 protobuf==7.35.0
@@ -35,7 +36,7 @@ PyJWT==2.13.0
 pyparsing==3.3.2
 python-dotenv==1.2.2
 python-multipart==0.0.30
-pywin32==311
+pywin32==311; sys_platform == "win32"
 referencing==0.37.0
 requests==2.34.2
 requests-oauthlib==2.0.0

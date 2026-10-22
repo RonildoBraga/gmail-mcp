@@ -9,4 +9,7 @@ credentials/fernet.key
 
 # Build artifacts & local backups
 *.egg-info/
+build/
+dist/
+.ruff_cache/
 backups/
