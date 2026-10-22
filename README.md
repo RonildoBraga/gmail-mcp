@@ -55,7 +55,7 @@ personal accounts, or device login errors with `redirect_uri`).
 ### Python env
 
 ```bash
-cd ~/Developer/gmail-mcp
+cd /absolute/path/to/gmail-mcp
 python3.13 -m venv .venv
 .venv/bin/python -m pip install .
 ```
@@ -88,9 +88,9 @@ stdio server:
 {
   "mcpServers": {
     "gmail-multi": {
-      "command": "/Users/ronildo/Developer/gmail-mcp/.venv/bin/python",
+      "command": "/absolute/path/to/gmail-mcp/.venv/bin/python",
       "args": ["-m", "gmail_mcp"],
-      "cwd": "/Users/ronildo/Developer/gmail-mcp"
+      "cwd": "/absolute/path/to/gmail-mcp"
     }
   }
 }
@@ -190,7 +190,72 @@ Tests use mocked APIs and temporary encrypted stores, with no live mail calls.
 CI runs these checks on Python 3.13 and 3.14 and imports the installed console
 entrypoint without starting authentication or the stdio server.
 
-## Security notes
+## Scoped mail-only launcher
+
+`gmail-mcp-mail-only` (or `python -m gmail_mcp.mail_only`) creates a separate
+server with an explicit account and tool allowlist. The original `gmail-mcp`
+launcher keeps its full local behavior. No account is allowed by default.
+
+```bash
+gmail-mcp-mail-only --help
+gmail-mcp-mail-only \
+  --allow-account you@gmail.com \
+  --allow-account you@hotmail.com \
+  --mode read-only
+```
+
+The default `read-only` mode exposes mail reads and native filter/rule reads.
+Every tool requires an explicit `account` that exactly matches the configured
+allowlist. Omitted accounts, changed defaults, unapproved accounts, cross-account
+search, sending, drafts creation, account administration and all Drive tools are
+excluded. Disallowed tools are absent from both discovery and invocation. The
+profile is enforced by the server, independently of ChatGPT tool toggles.
+
+After reviewing the intended access, `--mode organize` additionally exposes label,
+archive, supported moves and native filter/rule management. It still excludes
+sending and permanent mail deletion. Filter forwarding, destructive mail actions,
+unknown rule actions and unsafe destinations are rejected. Settings mutations
+retain their preview defaults and version checks. Deleting a filter or rule
+removes its definition; it does not delete existing mail. Read the launcher help
+and tool descriptions for supported destination limits.
+
+Outlook profile moves support only `archive` and `inbox`; custom or localized
+destination names are rejected rather than guessed. Gmail moves resolve existing
+label IDs to exclude SPAM/TRASH. Gmail filters permit `addLabelIds` and
+`removeLabelIds` only. Outlook rule writes permit `assignCategories`, `markAsRead`,
+`markImportance`, and `stopProcessingRules` only. Forwarding, redirecting, folder
+rule actions and mail deletion actions are excluded, including when an update
+would preserve unsafe existing actions. Explicitly disabling an unsafe rule or
+replacing its actions with the permitted subset remains possible.
+
+`GMAIL_MCP_ALLOWED_ACCOUNTS` accepts a comma-separated allowlist and
+`GMAIL_MCP_MODE` selects the mode; explicit CLI options override the corresponding
+environment setting. Profiles do not reduce existing OAuth grants. Adding an
+account or changing grants remains a separate authentication decision.
+
+To reuse an existing protected store without copying credentials, set an absolute
+`GMAIL_MCP_CREDENTIALS_DIR` before starting the process. `~` is expanded. The
+directory must already contain `accounts.db` and `fernet.key`; configured external
+stores never silently create a missing directory, database or key. Leaving the
+variable unset preserves the original credentials location. Server imports and
+tool discovery do not open the credential store or refresh tokens.
+
+For a private ChatGPT connection, [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+can run this stdio launcher directly. Confirm the exact organization/workspace
+association before creating a tunnel. Start in read-only mode, verify discovered
+tools, and test one approved account before enabling organization tools. Do not
+point a restricted connection at the full local launcher.
+
+The tunnel runtime key is separate from Gmail/Microsoft OAuth. A user should
+create a restricted key with **Tunnels Read + Use**, excluding Manage and unrelated
+API permissions, then provide it locally through a secure environment reference
+such as `CONTROL_PLANE_API_KEY`. Never put its value in chat, repository files,
+command arguments, screenshots or the ChatGPT plugin form. Tunnel creation needs
+Read + Manage; running the client needs Read + Use. Do not fall back to a broad
+admin key. Keep the client in the foreground for initial verification; automatic
+startup and additional access require separate approval.
+
+## Credential security
 
 - Each account's credentials live in **one Fernet-encrypted `auth_data` blob**
   (Google refresh token / MSAL token cache) — no secret material in the clear.

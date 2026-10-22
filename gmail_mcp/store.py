@@ -25,13 +25,37 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-CRED_DIR = Path(__file__).resolve().parent.parent / "credentials"
+def _credential_dir() -> Path:
+    """Choose a directory without accessing it; importing tools stays lazy."""
+    configured = os.environ.get("GMAIL_MCP_CREDENTIALS_DIR")
+    if configured is None:
+        return Path(__file__).resolve().parent.parent / "credentials"
+    directory = Path(configured).expanduser()
+    if not configured.strip() or not directory.is_absolute():
+        raise ValueError("GMAIL_MCP_CREDENTIALS_DIR must be a nonempty absolute directory path.")
+    return directory
+
+
+_EXTERNAL_CREDENTIALS = "GMAIL_MCP_CREDENTIALS_DIR" in os.environ
+CRED_DIR = _credential_dir()
 DB_PATH = CRED_DIR / "accounts.db"
 KEY_PATH = CRED_DIR / "fernet.key"
 
 
+def _require_existing_credentials() -> None:
+    if not CRED_DIR.is_dir() or not DB_PATH.is_file() or not KEY_PATH.is_file():
+        raise FileNotFoundError(
+            "GMAIL_MCP_CREDENTIALS_DIR must point to an existing credential directory containing "
+            "accounts.db and fernet.key. Point it to your existing installation's credentials; "
+            "no credentials were created."
+        )
+
+
 def _load_fernet() -> Fernet:
     """Load (or first-time generate) the symmetric key that encrypts auth_data."""
+    if _EXTERNAL_CREDENTIALS:
+        # A configured shared store is opt-in reuse, never first-time setup.
+        return Fernet(KEY_PATH.read_bytes())
     CRED_DIR.mkdir(exist_ok=True)
     if not KEY_PATH.exists():
         # Publish only a fully written key, and never replace another process's
@@ -80,9 +104,17 @@ class AccountStore:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        CRED_DIR.mkdir(exist_ok=True)
+        if _EXTERNAL_CREDENTIALS:
+            _require_existing_credentials()
+        else:
+            CRED_DIR.mkdir(exist_ok=True)
         self._fernet = _load_fernet()
-        self._db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        if _EXTERNAL_CREDENTIALS:
+            # mode=rw also prevents accidental creation if the file disappears
+            # after validation. as_uri escapes spaces and URI metacharacters.
+            self._db = sqlite3.connect(DB_PATH.as_uri() + "?mode=rw", uri=True, check_same_thread=False)
+        else:
+            self._db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute(
             """
