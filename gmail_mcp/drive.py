@@ -33,6 +33,29 @@ def file_meta(svc, file_id: str) -> dict:
     return svc.files().get(fileId=file_id, fields=FIELDS, supportsAllDrives=True).execute()
 
 
+def list_files(svc, max_results: int, page_token: str | None = None, **params) -> dict:
+    """Fill a bounded result page and expose continuation instead of truncating."""
+    if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+        raise ValueError("max_results must be a positive integer.")
+    files, seen = [], set()
+    token = page_token
+    while len(files) < max_results:
+        if token in seen:
+            raise RuntimeError("Drive pagination loop detected.")
+        seen.add(token)
+        resp = svc.files().list(
+            **params, fields=f"nextPageToken,files({FIELDS})",
+            pageSize=min(1000, max_results - len(files)),
+            **({"pageToken": token} if token else {}),
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return {"files": files, "next_page_token": token}
+
+
 def read_content(svc, file_id: str, max_chars: int = 200_000) -> tuple[dict, str | None]:
     """Return (metadata, text). text is None for binary files (images, PDFs, etc.)."""
     meta = file_meta(svc, file_id)

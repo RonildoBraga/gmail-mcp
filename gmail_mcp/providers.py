@@ -14,6 +14,32 @@ from . import auth, gmail, graph
 _MS_NO_LABELS = "Labels aren't supported for Microsoft (Outlook) accounts yet."
 
 
+def _gmail_items(resource, key: str, max_results: int, page_token: str | None = None,
+                 **kwargs) -> tuple[list[dict], str | None]:
+    """Fill a bounded result from Gmail's pages and return its native cursor."""
+    graph._limit(max_results)
+    items, seen = [], set()
+    while len(items) < max_results:
+        if page_token and page_token in seen:
+            raise RuntimeError("Gmail pagination loop detected")
+        seen.add(page_token)
+        remaining = min(max_results - len(items), 500)
+        params = {"userId": "me", "maxResults": remaining, **kwargs}
+        if page_token:
+            params["pageToken"] = page_token
+        response = resource.list(**params).execute()
+        values = response.get(key, [])
+        if len(values) > remaining:
+            raise RuntimeError("Gmail returned more results than requested")
+        items.extend(values)
+        page_token = response.get("nextPageToken")
+        if page_token and page_token in seen:
+            raise RuntimeError("Gmail pagination loop detected")
+        if not page_token:
+            break
+    return items, page_token
+
+
 class GmailProvider:
     provider = "google"
 
@@ -21,10 +47,14 @@ class GmailProvider:
         self.email = email
         self.svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-    def search_threads(self, query: str, max_results: int) -> dict:
-        resp = self.svc.users().threads().list(userId="me", q=query, maxResults=max_results).execute()
-        threads = [gmail.thread_summary(self.svc, t["id"]) for t in resp.get("threads", [])]
-        return {"account": self.email, "query": query, "threads": threads}
+    def search_threads(self, query: str, max_results: int,
+                       page_token: str | None = None) -> dict:
+        items, next_token = _gmail_items(
+            self.svc.users().threads(), "threads", max_results, page_token, q=query
+        )
+        threads = [gmail.thread_summary(self.svc, t["id"]) for t in items]
+        return {"account": self.email, "query": query, "threads": threads,
+                "next_page_token": next_token}
 
     def get_thread(self, thread_id: str) -> dict:
         t = self.svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
@@ -32,7 +62,8 @@ class GmailProvider:
 
     def list_labels(self) -> dict:
         labels = self.svc.users().labels().list(userId="me").execute().get("labels", [])
-        return {"account": self.email, "labels": [{"id": l["id"], "name": l["name"]} for l in labels]}
+        return {"account": self.email,
+                "labels": [{"id": label["id"], "name": label["name"]} for label in labels]}
 
     def create_label(self, name: str) -> dict:
         label = self.svc.users().labels().create(userId="me", body={"name": name}).execute()
@@ -49,9 +80,9 @@ class GmailProvider:
         return self.modify_labels(thread_id, add=[], remove=["INBOX"])
 
     def _label_id(self, name: str) -> str:
-        for l in self.svc.users().labels().list(userId="me").execute().get("labels", []):
-            if l["name"].lower() == name.lower():
-                return l["id"]
+        for label in self.svc.users().labels().list(userId="me").execute().get("labels", []):
+            if label["name"].lower() == name.lower():
+                return label["id"]
         return self.svc.users().labels().create(userId="me", body={"name": name}).execute()["id"]
 
     def move_thread(self, thread_id: str, folder: str) -> dict:
@@ -69,9 +100,11 @@ class GmailProvider:
         draft = self.svc.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
         return {"account": self.email, "draft_id": draft["id"]}
 
-    def list_drafts(self, max_results: int) -> dict:
-        resp = self.svc.users().drafts().list(userId="me", maxResults=max_results).execute()
-        return {"account": self.email, "drafts": resp.get("drafts", [])}
+    def list_drafts(self, max_results: int, page_token: str | None = None) -> dict:
+        drafts, next_token = _gmail_items(
+            self.svc.users().drafts(), "drafts", max_results, page_token
+        )
+        return {"account": self.email, "drafts": drafts, "next_page_token": next_token}
 
     def send_message(self, to, subject, body, cc, bcc) -> dict:
         raw = gmail.build_raw_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
@@ -87,9 +120,11 @@ class GraphProvider:
         self.email = email
         self.token = token
 
-    def search_threads(self, query: str, max_results: int) -> dict:
-        threads = graph.search_threads(self.token, query, max_results)
-        return {"account": self.email, "query": query, "threads": threads}
+    def search_threads(self, query: str, max_results: int,
+                       page_token: str | None = None) -> dict:
+        return {"account": self.email, "query": query,
+                **graph.search_threads(self.token, query, max_results, page_token,
+                                       account=self.email)}
 
     def get_thread(self, thread_id: str) -> dict:
         return {"account": self.email, "thread": graph.get_thread(self.token, thread_id)}
@@ -97,8 +132,9 @@ class GraphProvider:
     def create_draft(self, to, subject, body, cc, bcc) -> dict:
         return {"account": self.email, **graph.create_draft(self.token, to, subject, body, cc, bcc)}
 
-    def list_drafts(self, max_results: int) -> dict:
-        return {"account": self.email, "drafts": graph.list_drafts(self.token, max_results)}
+    def list_drafts(self, max_results: int, page_token: str | None = None) -> dict:
+        return {"account": self.email,
+                **graph.list_drafts(self.token, max_results, page_token, account=self.email)}
 
     def send_message(self, to, subject, body, cc, bcc) -> dict:
         return {"account": self.email, **graph.send_message(self.token, to, subject, body, cc, bcc)}

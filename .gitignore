@@ -5,8 +5,13 @@ __pycache__/
 # Secrets & per-account tokens — never commit
 credentials/client_secret.json
 credentials/accounts.db
+credentials/accounts.db-*
 credentials/fernet.key
+credentials/.fernet-*
 
 # Build artifacts & local backups
 *.egg-info/
+build/
+dist/
+.ruff_cache/
 backups/
