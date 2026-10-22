@@ -14,6 +14,8 @@ OLD_FILTER = {"id": "old", **FILTER}
 RULE = {"id": "rule/one", "displayName": "Billing", "sequence": 7, "isEnabled": False,
         "isReadOnly": False, "conditions": {"senderContains": ["billing"]},
         "exceptions": {"subjectContains": ["personal"]}, "actions": {"markAsRead": True}}
+MALFORMED_CREATED = (None, [], "unexpected", {}, {"id": None}, {"id": ""}, {"id": " "},
+                     {"id": 1}, {"id": True}, {"id": []})
 
 
 class ProviderDenied(Exception):
@@ -56,6 +58,18 @@ class GmailFiltersTests(unittest.TestCase):
         self.assertEqual(result["status"], "created")
         self.assertEqual(result["recovery"]["filter_id"], "new")
         self.resource.create.assert_called_once_with(userId="me", body=FILTER)
+
+    def test_malformed_create_response_is_uncertain_and_never_retried(self):
+        for response in MALFORMED_CREATED:
+            with self.subTest(response=response):
+                self.resource.reset_mock()
+                self.resource.create.return_value.execute.return_value = response
+                result = rules.create_filter(self.provider, FILTER, dry_run=False)
+                self.assertEqual(result["status"], "uncertain")
+                self.assertFalse(result["retry_safe"])
+                self.assertEqual(result["filter"], FILTER)
+                self.resource.create.assert_called_once()
+                self.resource.delete.assert_not_called()
 
     def test_delete_preserves_recreation_body_and_requires_preview(self):
         with self.assertRaisesRegex(ValueError, "expected_version"):
@@ -121,6 +135,22 @@ class GmailFiltersTests(unittest.TestCase):
         result = rules.replace_filter(self.provider, "old", FILTER, False, version)
         self.assertEqual(result["status"], "uncertain")
         self.resource.delete.assert_not_called()
+
+    def test_malformed_replacement_response_retains_old_filter_and_recovery(self):
+        version = rules.get_filter(self.provider, "old")["expected_version"]
+        for response in MALFORMED_CREATED:
+            with self.subTest(response=response):
+                self.resource.reset_mock()
+                self.resource.create.return_value.execute.return_value = response
+                result = rules.replace_filter(self.provider, "old", FILTER, False, version)
+                self.assertEqual(result["status"], "uncertain")
+                self.assertFalse(result["old_filter_delete_attempted"])
+                self.assertFalse(result["retry_safe"])
+                self.assertEqual(result["old_filter_id"], "old")
+                self.assertIsNone(result["new_filter_id"])
+                self.assertEqual(result["recovery"]["old_filter"], FILTER)
+                self.resource.create.assert_called_once()
+                self.resource.delete.assert_not_called()
 
     def test_permission_errors_include_explicit_reconnect_guidance(self):
         self.resource.list.return_value.execute.side_effect = ProviderDenied()
@@ -199,14 +229,28 @@ class InboxRulesTests(unittest.TestCase):
         self.assertEqual(result["status"], "updated")
         self.assertEqual(self.request.call_args.args[1:], ("PATCH", rules._RULES + "/rule%2Fone", patch_body))
         self.assertNotIn("sequence", self.request.call_args.args[3])
-        self.assertEqual(result["recovery"]["patch"]["sequence"], 7)
-        self.assertFalse(result["recovery"]["patch"]["isEnabled"])
-        self.assertEqual(result["recovery"]["patch"]["exceptions"], RULE["exceptions"])
+        self.assertEqual(result["recovery"]["patch"], {
+            "isEnabled": False, "exceptions": RULE["exceptions"],
+        })
 
     def test_explicit_sequence_sent_without_other_defaults(self):
         version = self.version()
-        rules.update_inbox_rule(self.provider, "rule/one", {"sequence": 4}, False, version)
+        result = rules.update_inbox_rule(self.provider, "rule/one", {"sequence": 4}, False, version)
         self.assertEqual(self.request.call_args.args[3], {"sequence": 4})
+        self.assertEqual(result["recovery"]["patch"], {"sequence": 7})
+
+    def test_recovery_does_not_overwrite_independent_later_changes(self):
+        self.snapshot["isEnabled"] = True
+        preview = rules.update_inbox_rule(self.provider, "rule/one", {"isEnabled": False})
+        recovery = preview["recovery"]["patch"]
+        self.assertEqual(recovery, {"isEnabled": True})
+        self.snapshot.update({"isEnabled": False, "sequence": 3,
+                              "actions": {"moveToFolder": "new-folder"}})
+        version = self.version()
+        rules.update_inbox_rule(self.provider, "rule/one", recovery, False, version)
+        self.assertEqual(self.request.call_args.args[3], {"isEnabled": True})
+        self.assertEqual(self.snapshot["sequence"], 3)
+        self.assertEqual(self.snapshot["actions"], {"moveToFolder": "new-folder"})
 
     def test_readonly_rules_refuse_update_and_delete(self):
         self.snapshot["isReadOnly"] = True
@@ -257,6 +301,18 @@ class InboxRulesTests(unittest.TestCase):
         self.request.return_value = {}
         result = rules.create_inbox_rule(self.provider, rules._rule_restore(RULE), False)
         self.assertEqual(result["status"], "uncertain")
+
+    def test_malformed_create_response_is_uncertain_and_never_retried(self):
+        for response in MALFORMED_CREATED:
+            with self.subTest(response=response):
+                self.request.reset_mock()
+                self.request.return_value = response
+                body = rules._rule_restore(RULE)
+                result = rules.create_inbox_rule(self.provider, body, False)
+                self.assertEqual(result["status"], "uncertain")
+                self.assertFalse(result["retry_safe"])
+                self.assertEqual(result["rule"], body)
+                self.request.assert_called_once()
 
     def test_patch_restore_clears_new_exceptions_when_previously_absent(self):
         del self.snapshot["exceptions"]

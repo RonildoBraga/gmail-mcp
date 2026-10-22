@@ -109,7 +109,9 @@ def google_credentials(email: str, auth: dict) -> Credentials:
         if not creds.refresh_token:
             raise ValueError(f"Account {email!r} has no refresh token; re-connect it.")
         creds.refresh(Request())
-        store().update_auth(email, _google_auth_data(creds))
+        store().update_auth(
+            email, _google_auth_data(creds), expected_provider="google", expected_auth_data=auth,
+        )
     return creds
 
 
@@ -177,7 +179,9 @@ def graph_token(email: str, auth: dict) -> str:
     if not result or "access_token" not in result:
         raise ValueError(f"Could not silently refresh {email!r}; re-connect it.")
     if cache.has_state_changed or auth.get("home_account_id") != account["home_account_id"]:
-        store().update_auth(email, {
-            **auth, "msal_cache": cache.serialize(), "home_account_id": account["home_account_id"],
-        })
+        store().update_auth(
+            email,
+            {**auth, "msal_cache": cache.serialize(), "home_account_id": account["home_account_id"]},
+            expected_provider="microsoft", expected_auth_data=auth,
+        )
     return result["access_token"]

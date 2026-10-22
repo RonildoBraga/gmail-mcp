@@ -3,7 +3,9 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,6 +110,130 @@ class StoreTests(unittest.TestCase):
             self.s.get("ACCOUNT@example.com")
         with self.assertRaisesRegex(ValueError, "ambiguous case variants"):
             self.s.upsert("Account@example.com", "google", {})
+
+    def _assert_concurrent_collision(self, first_provider, first_auth, second_provider,
+                                     second_auth, *, same_connection=False):
+        other = self.s if same_connection else store.AccountStore()
+        if other is not self.s:
+            self.addCleanup(other._db.close)
+        checked, release, second_started = threading.Event(), threading.Event(), threading.Event()
+        encrypt = self.s._fernet.encrypt
+
+        def pause_first(data):
+            # Hold the first writer between validation and insertion, exactly
+            # where an unprotected second writer used to bypass the guard.
+            checked.set()
+            if not release.wait(timeout=3):
+                raise AssertionError("First writer was never released")
+            return encrypt(data)
+
+        def second_write():
+            second_started.set()
+            try:
+                other.upsert("same@example.com", second_provider, second_auth)
+            except ValueError:
+                return "rejected"
+            return "overwrote"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with patch.object(self.s._fernet, "encrypt", side_effect=pause_first):
+                first = executor.submit(self.s.upsert, "same@example.com", first_provider, first_auth)
+                self.assertTrue(checked.wait(timeout=3))
+                second = executor.submit(second_write)
+                try:
+                    self.assertTrue(second_started.wait(timeout=3))
+                    # Give the competing writer a chance to exercise the old
+                    # race; the new writer lock keeps it pending until commit.
+                    threading.Event().wait(0.05)
+                finally:
+                    release.set()
+                self.assertIsNone(first.result(timeout=3))
+                self.assertEqual(second.result(timeout=3), "rejected")
+        self.assertEqual(self.s.get("same@example.com")["provider"], first_provider)
+        self.assertEqual(self.s.get("same@example.com")["auth_data"], first_auth)
+        # A rejected transaction must release its SQLite writer lock.
+        other.upsert("unrelated@example.com", "google", {})
+
+    def test_concurrent_stores_cannot_bypass_provider_collision(self):
+        self._assert_concurrent_collision("google", {"original": True}, "microsoft",
+                                          {"home_account_id": "other"})
+
+    def test_concurrent_stores_cannot_bypass_microsoft_identity_binding(self):
+        self._assert_concurrent_collision("microsoft", {"home_account_id": "first"}, "microsoft",
+                                          {"home_account_id": "second"})
+
+    def test_shared_connection_serializes_collision_check_and_write(self):
+        self._assert_concurrent_collision("google", {"original": True}, "microsoft",
+                                          {"home_account_id": "other"}, same_connection=True)
+
+    def test_stale_refresh_cannot_replace_reconnected_provider(self):
+        previous = {"home_account_id": "first", "token": "old"}
+        self.s.upsert("same@example.com", "microsoft", previous)
+        other = store.AccountStore()
+        self.addCleanup(other._db.close)
+        other.remove("same@example.com")
+        other.upsert("same@example.com", "google", {"token": "new-provider"})
+        with self.assertRaisesRegex(ValueError, "credentials changed; retry"):
+            self.s.update_auth("same@example.com", {**previous, "token": "refreshed"},
+                               expected_provider="microsoft", expected_auth_data=previous)
+        self.assertEqual(self.s.get("same@example.com")["auth_data"], {"token": "new-provider"})
+
+    def test_stale_refresh_snapshot_is_rejected_and_matching_snapshot_succeeds(self):
+        original = {"home_account_id": "first", "token": "original"}
+        newer = {**original, "token": "newer"}
+        self.s.upsert("same@example.com", "microsoft", original)
+        self.s.update_auth("same@example.com", newer, expected_provider="microsoft",
+                           expected_auth_data=original)
+        with self.assertRaisesRegex(ValueError, "credentials changed; retry"):
+            self.s.update_auth("same@example.com", original, expected_provider="microsoft",
+                               expected_auth_data=original)
+        self.assertEqual(self.s.get("same@example.com")["auth_data"], newer)
+
+    def test_refresh_cannot_change_or_drop_bound_microsoft_identity(self):
+        original = {"home_account_id": "first", "token": "original"}
+        self.s.upsert("same@example.com", "microsoft", original)
+        for replacement in ({"home_account_id": "second"}, {"token": "missing-id"}):
+            with self.subTest(replacement=replacement):
+                with self.assertRaisesRegex(ValueError, "Microsoft identity changed"):
+                    self.s.update_auth("same@example.com", replacement)
+                self.assertEqual(self.s.get("same@example.com")["auth_data"], original)
+
+    def test_refresh_of_removed_account_requires_retry(self):
+        with self.assertRaisesRegex(ValueError, "credentials changed; retry"):
+            self.s.update_auth("removed@example.com", {}, expected_provider="google",
+                               expected_auth_data={})
+        with self.assertRaises(KeyError):
+            self.s.update_auth("removed@example.com", {})
+
+
+class KeyPublicationTests(unittest.TestCase):
+    def test_concurrent_first_use_shares_one_complete_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            barrier = threading.Barrier(4)
+            generate_key = Fernet.generate_key
+
+            def concurrent_key():
+                barrier.wait(timeout=3)
+                return generate_key()
+
+            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"):
+                with patch.object(Fernet, "generate_key", side_effect=concurrent_key):
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        keys = list(executor.map(lambda _: store._load_fernet(), range(4)))
+                published = Fernet(store.KEY_PATH.read_bytes())
+                for key in keys:
+                    self.assertEqual(published.decrypt(key.encrypt(b"test-secret")), b"test-secret")
+                self.assertEqual(list(root.iterdir()), [store.KEY_PATH])
+
+    def test_failed_publication_cleans_temporary_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"):
+                with patch.object(store.os, "link", side_effect=OSError("disk error")):
+                    with self.assertRaisesRegex(OSError, "disk error"):
+                        store._load_fernet()
+                self.assertEqual(list(root.iterdir()), [])
 
 
 if __name__ == "__main__":

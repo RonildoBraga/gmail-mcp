@@ -167,6 +167,9 @@ empty predicate objects are retained. Graph rules marked `isReadOnly` reject
 update/deletion. Creating a rule requires an explicit sequence; Graph can
 recalculate other rules' order. Recovery recreates settings, potentially with new
 IDs/order, and cannot undo mail that a rule already forwarded, moved or deleted.
+Update recovery patches restore only fields changed by the original update, so
+unrelated later edits are preserved. Malformed create responses are reported as
+uncertain and are never a reason to retry or remove the old Gmail filter.
 
 Permission errors provide reconnect guidance. Existing stored scopes are reused;
 these tools never launch consent or request additional grants. Any reconnect is
@@ -197,6 +200,10 @@ entrypoint without starting authentication or the stdio server.
 - Existing email/default selectors remain unchanged. Provider collisions are
   rejected in either direction, including case variants. Use a distinct Microsoft
   alias when its primary address is already stored as Google.
+- Collision checks and credential writes are serialized across store connections.
+  Refresh persistence compares the original account/provider snapshot and refuses
+  to overwrite credentials changed by another process. First-use key creation
+  publishes one complete key without overwriting another process's key.
 - Microsoft records bind to MSAL's stable `home_account_id`. Legacy caches are
   bound lazily when there is one exact username match or a sole cached identity
   (the latter preserves existing alias selectors). Ambiguous/mismatched caches

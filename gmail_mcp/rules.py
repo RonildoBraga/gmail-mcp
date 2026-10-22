@@ -135,6 +135,12 @@ def _rule_restore(snapshot: dict) -> dict:
     return {key: copy.deepcopy(value) for key, value in snapshot.items() if key in _RULE_FIELDS}
 
 
+def _created_id(response) -> str | None:
+    """A malformed success body cannot prove which object was created."""
+    value = response.get("id") if isinstance(response, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _writable(snapshot: dict) -> None:
     if snapshot.get("isReadOnly"):
         raise ValueError("This Outlook rule isReadOnly and cannot be modified or deleted through Graph.")
@@ -163,12 +169,13 @@ def create_filter(provider, filter: dict, dry_run: bool = True) -> dict:
         created = _google(provider, "create", body=body)
     except Exception as exc:
         return {**result, **_failed(exc, provider)}
-    if not created.get("id"):
+    created_id = _created_id(created)
+    if created_id is None:
         return {**result, "status": "uncertain", "retry_safe": False,
                 "guidance": "Create returned no ID; inspect filters before retrying."}
     return {**result, "status": "created", "filter": created,
             "recovery": {"operation": "delete_filter", "account": provider.email,
-                         "filter_id": created.get("id"), "preview_required": True}}
+                         "filter_id": created_id, "preview_required": True}}
 
 
 def delete_filter(provider, filter_id: str, dry_run: bool = True, expected_version: str | None = None) -> dict:
@@ -210,7 +217,7 @@ def replace_filter(provider, filter_id: str, filter: dict, dry_run: bool = True,
     except Exception as exc:
         return {**result, **_failed(exc, provider), "old_filter_id": filter_id,
                 "old_filter_delete_attempted": False, "new_filter_id": None}
-    new_id = created.get("id")
+    new_id = _created_id(created)
     if not new_id or new_id == filter_id:
         return {**result, "status": "uncertain", "old_filter_id": filter_id, "new_filter_id": new_id,
                 "old_filter_delete_attempted": False, "retry_safe": False,
@@ -256,12 +263,13 @@ def create_inbox_rule(provider, rule: dict, dry_run: bool = True) -> dict:
         created = _graph(provider, "POST", _RULES, body)
     except Exception as exc:
         return {**result, **_failed(exc, provider)}
-    if not created.get("id"):
+    created_id = _created_id(created)
+    if created_id is None:
         return {**result, "status": "uncertain", "retry_safe": False,
                 "guidance": "Create returned no ID; inspect Inbox rules before retrying."}
     return {**result, "status": "created", "rule": created,
             "recovery": {"operation": "delete_inbox_rule", "account": provider.email,
-                         "rule_id": created.get("id"), "preview_required": True,
+                         "rule_id": created_id, "preview_required": True,
                          "note": "Deleting cannot undo mail actions or provider sequence recalculation."}}
 
 
@@ -271,7 +279,9 @@ def update_inbox_rule(provider, rule_id: str, patch: dict, dry_run: bool = True,
     current = get_inbox_rule(provider, rule_id)
     snapshot = current["rule"]
     _writable(snapshot)
-    restore = _rule_restore(snapshot)
+    # Undo only fields this patch changed. Replaying the whole rule can erase
+    # independent edits or reorder rules during an otherwise unrelated undo.
+    restore = {field: copy.deepcopy(snapshot[field]) for field in body if field in snapshot}
     for field in ("conditions", "exceptions"):
         if field in body and field not in snapshot:
             restore[field] = {}

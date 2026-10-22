@@ -50,7 +50,8 @@ class MicrosoftIdentityTests(unittest.TestCase):
         self.app.acquire_token_silent.assert_called_once_with(["Mail.Read"], account=self.intended)
         self.store.update_auth.assert_called_once_with("PRIMARY@example.com", {
             **self.auth_data, "home_account_id": "intended.tenant", "msal_cache": "updated-cache",
-        })
+        }, expected_provider="microsoft", expected_auth_data=self.auth_data)
+        self.assertIs(self.store.update_auth.call_args.kwargs["expected_auth_data"], self.auth_data)
 
     def test_legacy_alias_with_sole_cached_account_is_bound(self):
         del self.auth_data["home_account_id"]
@@ -98,7 +99,26 @@ class MicrosoftIdentityTests(unittest.TestCase):
         auth.graph_token("primary@example.com", self.auth_data)
         self.store.update_auth.assert_called_once_with("primary@example.com", {
             **self.auth_data, "msal_cache": "updated-cache",
-        })
+        }, expected_provider="microsoft", expected_auth_data=self.auth_data)
+
+    def test_credential_change_during_refresh_propagates_without_returning_token(self):
+        self.cache.has_state_changed = True
+        conflict = RuntimeError("Credentials changed during refresh")
+        self.store.update_auth.side_effect = conflict
+        with self.assertRaises(RuntimeError) as caught:
+            auth.graph_token("primary@example.com", self.auth_data)
+        self.assertIs(caught.exception, conflict)
+        self.assertEqual(self.store.update_auth.call_args.kwargs["expected_provider"], "microsoft")
+        self.assertIs(self.store.update_auth.call_args.kwargs["expected_auth_data"], self.auth_data)
+
+    def test_credential_change_during_legacy_binding_propagates(self):
+        del self.auth_data["home_account_id"]
+        conflict = RuntimeError("Credentials changed during identity binding")
+        self.store.update_auth.side_effect = conflict
+        with self.assertRaises(RuntimeError) as caught:
+            auth.graph_token("primary@example.com", self.auth_data)
+        self.assertIs(caught.exception, conflict)
+        self.assertIs(self.store.update_auth.call_args.kwargs["expected_auth_data"], self.auth_data)
 
     def test_connect_records_stable_identity_even_for_alias(self):
         self.app.get_accounts.return_value = [self.intended]
@@ -151,6 +171,30 @@ class GoogleScopeTests(unittest.TestCase):
         persisted = fake_store.update_auth.call_args.args[1]
         self.assertEqual(persisted["scopes"], [])
         self.assertTrue(set(auth.GOOGLE_SCOPES).isdisjoint(persisted["scopes"]))
+        self.assertEqual(fake_store.update_auth.call_args.kwargs["expected_provider"], "google")
+        self.assertIs(fake_store.update_auth.call_args.kwargs["expected_auth_data"], stored)
+
+    def test_credential_change_during_google_refresh_propagates(self):
+        stored = {
+            "access_token": "expired", "refresh_token": "existing-refresh",
+            "token_uri": "https://oauth.example/token", "client_id": "client",
+            "client_secret": "secret", "scopes": ["stored-scope"], "expiry": None,
+        }
+        creds = Mock(
+            valid=False, token="refreshed", refresh_token="existing-refresh",
+            token_uri=stored["token_uri"], client_id="client", client_secret="secret",
+            scopes=["stored-scope"], granted_scopes=None, expiry=None,
+        )
+        conflict = RuntimeError("Credentials changed during refresh")
+        fake_store = Mock()
+        fake_store.update_auth.side_effect = conflict
+        with patch.object(auth, "Credentials", return_value=creds), \
+                patch.object(auth, "Request"), patch.object(auth, "_store", fake_store):
+            with self.assertRaises(RuntimeError) as caught:
+                auth.google_credentials("legacy@example.com", stored)
+        self.assertIs(caught.exception, conflict)
+        self.assertEqual(fake_store.update_auth.call_args.kwargs["expected_provider"], "google")
+        self.assertIs(fake_store.update_auth.call_args.kwargs["expected_auth_data"], stored)
 
     def test_persistence_uses_explicit_granted_scopes(self):
         creds = Mock(
