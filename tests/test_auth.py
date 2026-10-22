@@ -1,7 +1,13 @@
 """Authentication regressions use fake caches/apps, never a real account."""
 
 import importlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gmail_mcp import auth
@@ -129,6 +135,30 @@ class MicrosoftIdentityTests(unittest.TestCase):
 
 
 class LazyStoreTests(unittest.TestCase):
+    def test_external_directory_import_selects_all_paths_without_initializing_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "external credentials"
+            code = """
+import json
+from gmail_mcp import auth, store
+print(json.dumps({
+    "directory": str(store.CRED_DIR), "database": str(store.DB_PATH),
+    "key": str(store.KEY_PATH), "client_secret": str(auth.GOOGLE_CLIENT_SECRET_PATH),
+    "store_uninitialized": auth._store is None,
+}))
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", code], check=True, text=True, capture_output=True,
+                env={**os.environ, "GMAIL_MCP_CREDENTIALS_DIR": str(target)},
+            )
+            selected = json.loads(completed.stdout)
+            self.assertEqual(selected, {
+                "directory": str(target), "database": str(target / "accounts.db"),
+                "key": str(target / "fernet.key"), "client_secret": str(target / "client_secret.json"),
+                "store_uninitialized": True,
+            })
+            self.assertFalse(target.exists())
+
     def test_import_does_not_initialize_credential_store(self):
         with patch("gmail_mcp.store.AccountStore") as factory:
             importlib.reload(auth)

@@ -34,3 +34,4 @@ jobs:
           python -m pip install --no-deps dist/*.whl
           python -m pip check
           python -I -c 'import importlib.metadata as m; import gmail_mcp.server; assert next(iter(m.entry_points(group="console_scripts", name="gmail-mcp"))).load() is gmail_mcp.server.main; assert gmail_mcp.server.auth._store is None'
+          gmail-mcp-mail-only --help

@@ -1,6 +1,7 @@
 """Credential-store coverage stays in disposable databases with disposable keys."""
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -22,6 +23,7 @@ class StoreTests(unittest.TestCase):
         self.enterContext(patch.object(store, "CRED_DIR", self.root))
         self.enterContext(patch.object(store, "DB_PATH", self.root / "accounts.db"))
         self.enterContext(patch.object(store, "KEY_PATH", self.root / "fernet.key"))
+        self.enterContext(patch.object(store, "_EXTERNAL_CREDENTIALS", False))
         self.s = store.AccountStore()
         self.addCleanup(self.s._db.close)
 
@@ -205,8 +207,76 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.s.update_auth("removed@example.com", {})
 
+    def test_external_store_reuses_existing_files_without_generating_key(self):
+        self.s.upsert("test@example.com", "google", {"test": "temporary-only"})
+        original_key = store.KEY_PATH.read_bytes()
+        with patch.object(store, "_EXTERNAL_CREDENTIALS", True), \
+                patch.object(Fernet, "generate_key", side_effect=AssertionError("must reuse key")):
+            other = store.AccountStore()
+            self.addCleanup(other._db.close)
+            self.assertEqual(other.get("test@example.com")["auth_data"], {"test": "temporary-only"})
+            self.assertEqual(store.KEY_PATH.read_bytes(), original_key)
+
+    def test_external_store_missing_directory_or_files_fails_before_opening(self):
+        for present in ((), ("directory",), ("directory", "accounts.db"), ("directory", "fernet.key")):
+            with self.subTest(present=present):
+                with tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder) / "external"
+                    if "directory" in present:
+                        root.mkdir()
+                    for name in ("accounts.db", "fernet.key"):
+                        if name in present:
+                            (root / name).touch()
+                    before = list(root.iterdir()) if root.exists() else None
+                    with patch.object(store, "CRED_DIR", root), \
+                            patch.object(store, "DB_PATH", root / "accounts.db"), \
+                            patch.object(store, "KEY_PATH", root / "fernet.key"), \
+                            patch.object(store, "_EXTERNAL_CREDENTIALS", True), \
+                            patch.object(store, "_load_fernet") as loader, \
+                            patch.object(store.sqlite3, "connect") as connect:
+                        with self.assertRaisesRegex(FileNotFoundError, "no credentials were created"):
+                            store.AccountStore()
+                    loader.assert_not_called()
+                    connect.assert_not_called()
+                    self.assertEqual(list(root.iterdir()) if root.exists() else None, before)
+
+    def test_external_db_disappearing_after_validation_is_not_recreated(self):
+        missing = self.root / "missing.db"
+        with patch.object(store, "DB_PATH", missing), patch.object(store, "_EXTERNAL_CREDENTIALS", True), \
+                patch.object(store, "_require_existing_credentials"):
+            with self.assertRaises(sqlite3.OperationalError):
+                store.AccountStore()
+        self.assertFalse(missing.exists())
+
+
+class CredentialDirectoryConfigTests(unittest.TestCase):
+    def test_unset_option_keeps_legacy_directory(self):
+        with patch.dict(os.environ):
+            os.environ.pop("GMAIL_MCP_CREDENTIALS_DIR", None)
+            self.assertEqual(store._credential_dir(), Path(store.__file__).resolve().parent.parent / "credentials")
+
+    def test_relative_or_empty_option_is_rejected(self):
+        for value in ("", " ", "credentials", "../credentials"):
+            with self.subTest(value=value), patch.dict(os.environ, {"GMAIL_MCP_CREDENTIALS_DIR": value}):
+                with self.assertRaisesRegex(ValueError, "nonempty absolute"):
+                    store._credential_dir()
+
+    def test_absolute_option_accepts_spaces_without_accessing_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "external credentials"
+            with patch.dict(os.environ, {"GMAIL_MCP_CREDENTIALS_DIR": str(target)}):
+                self.assertEqual(store._credential_dir(), target)
+                self.assertFalse(target.exists())
+
+    def test_option_expands_current_user_home(self):
+        with patch.dict(os.environ, {"GMAIL_MCP_CREDENTIALS_DIR": "~/mail-mcp-test-credentials"}):
+            self.assertEqual(store._credential_dir(), Path("~/mail-mcp-test-credentials").expanduser())
+
 
 class KeyPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(store, "_EXTERNAL_CREDENTIALS", False))
+
     def test_concurrent_first_use_shares_one_complete_key(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
