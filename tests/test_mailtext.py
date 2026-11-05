@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from gmail_mcp import mailtext
@@ -52,6 +53,23 @@ class HtmlToTextTests(unittest.TestCase):
     def test_link_whose_text_is_its_url_is_not_repeated(self):
         self.assertEqual(mailtext.html_to_text('<a href="https://a.com/">https://a.com</a>'), "https://a.com")
 
+    def test_only_the_outer_of_nested_links_is_followed(self):
+        html = '<a href="https://a.com/1"><a href="https://b.com/2">Open</a></a>'
+        self.assertEqual(mailtext.html_to_text(html), "Open (https://a.com/1)")
+
+    def test_preformatted_text_keeps_its_line_breaks(self):
+        self.assertEqual(mailtext.html_to_text("<pre>one\ntwo</pre>"), "one\ntwo")
+
+    def test_hostile_markup_is_handled_in_linear_time(self):
+        cases = {"unmatched closing tags": "<div>" * 100_000 + "</span>" * 100_000,
+                 "deep nesting with text": "<div>x" * 100_000,
+                 "nested links": '<a href="https://a.com">x' * 20_000 + "</a>" * 20_000}
+        for name, html in cases.items():
+            with self.subTest(name):
+                started = time.monotonic()
+                mailtext.html_to_text(html)
+                self.assertLess(time.monotonic() - started, 15)
+
     def test_image_only_and_mail_links_add_nothing(self):
         html = '<a href="https://a.com/x"><img src="y"></a><a href="mailto:a@example.com">Mail us</a>'
         self.assertEqual(mailtext.html_to_text(html), "Mail us")
@@ -88,6 +106,9 @@ class BestTextTests(unittest.TestCase):
 
     def test_html_only_messages_are_converted(self):
         self.assertEqual(mailtext.best_text("", "<p>Hi</p>"), "Hi")
+
+    def test_conversion_can_be_supplied_by_the_caller(self):
+        self.assertEqual(mailtext.best_text("", "<p>Hi</p>", lambda source: "converted"), "converted")
 
 
 class LimitTests(unittest.TestCase):

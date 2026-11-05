@@ -82,6 +82,27 @@ class ExtractTextTests(unittest.TestCase):
         })
         self.assertEqual(documents.extract_text(data, "a.xlsx", "")["text"], "Sheet 1\nName\t5\tnote")
 
+    def sheet(self, cells: str) -> dict:
+        data = zipped({"xl/worksheets/sheet1.xml": f"<worksheet {SHEET}><sheetData>{cells}</sheetData></worksheet>"})
+        return documents.extract_text(data, "a.xlsx", "")
+
+    def test_excel_values_stay_in_their_own_columns(self):
+        rows = ('<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c>'
+                '<c r="B1" t="inlineStr"><is><t>Debit</t></is></c>'
+                '<c r="C1" t="inlineStr"><is><t>Credit</t></is></c></row>'
+                '<row r="2"><c r="A2" t="inlineStr"><is><t>Alice</t></is></c><c r="C2"><v>100</v></c></row>')
+        self.assertEqual(self.sheet(rows)["text"], "Sheet 1\nName\tDebit\tCredit\nAlice\t\t100")
+
+    def test_excel_columns_past_z_are_positioned(self):
+        self.assertEqual(documents._column_index("AA1"), 26)
+        self.assertEqual(documents._column_index("XFD1"), 16_383)
+
+    def test_excel_references_beyond_the_real_limit_are_ignored(self):
+        self.assertEqual(self.sheet('<row><c r="ZZZZZZZZ1"><v>5</v></c></row>')["text"], "Sheet 1\n5")
+
+    def test_excel_cells_without_references_are_kept_in_order(self):
+        self.assertEqual(self.sheet("<row><c><v>1</v></c><c><v>2</v></c></row>")["text"], "Sheet 1\n1\t2")
+
     def test_oversized_zip_members_are_refused(self):
         data = zipped({"word/document.xml": "x"})
         with patch.object(documents, "_MAX_UNZIPPED_BYTES", 0):
@@ -110,6 +131,27 @@ class ExtractTextTests(unittest.TestCase):
             result = documents.extract_text(b"%PDF", "a.pdf", "application/pdf")
         self.assertIsNone(result["text"])
         self.assertIn("too long", result["note"])
+
+    def test_html_attachments_are_parsed_in_the_child_process_too(self):
+        done = subprocess.CompletedProcess([], 0, b'{"text": "ok"}', b"")
+        with patch.object(documents.subprocess, "run", return_value=done) as run:
+            documents.extract_text(b"<p>x</p>", "a.html", "text/html")
+        run.assert_called_once()
+
+    def test_small_message_bodies_are_converted_in_process(self):
+        with patch.object(documents.subprocess, "run") as run:
+            self.assertEqual(documents.html_text("<p>Hi</p>"), "Hi")
+        run.assert_not_called()
+
+    def test_large_message_bodies_are_converted_in_the_child_process(self):
+        with patch.object(documents, "_LARGEST_IN_PROCESS_HTML", 4):
+            self.assertEqual(documents.html_text("<p>Hi</p>"), "Hi")
+
+    def test_a_message_body_that_times_out_says_so(self):
+        expired = subprocess.TimeoutExpired("python", 60)
+        with patch.object(documents, "_LARGEST_IN_PROCESS_HTML", 4), \
+             patch.object(documents.subprocess, "run", side_effect=expired):
+            self.assertIn('body_format="html"', documents.html_text("<p>Hi</p>"))
 
     def test_parsing_runs_in_an_isolated_child_process(self):
         done = subprocess.CompletedProcess([], 0, b'{"text": "ok"}', b"")
@@ -166,6 +208,24 @@ class SaveTests(unittest.TestCase):
 
     def test_long_names_keep_their_extension(self):
         self.assertTrue(documents.safe_filename("a" * 400 + ".pdf").endswith(".pdf"))
+
+    def test_names_are_limited_by_bytes_not_characters(self):
+        name = documents.safe_filename("发票" * 100 + ".pdf")
+        self.assertTrue(name.endswith(".pdf"))
+        self.assertLessEqual(len(name.encode()), 240)
+
+    def test_cutting_a_name_never_splits_a_character(self):
+        name = documents.safe_filename("a" + "发" * 200 + ".pdf")
+        self.assertNotIn("\ufffd", name)
+
+    def test_long_non_ascii_names_save_and_can_be_duplicated(self):
+        first = documents.save(b"1", "发票" * 100 + ".pdf")
+        second = documents.save(b"2", "发票" * 100 + ".pdf")
+        self.assertNotEqual(first, second)
+        self.assertEqual(second.suffix, ".pdf")
+
+    def test_names_with_no_real_extension_survive(self):
+        self.assertTrue(documents.safe_filename("note." + "x" * 300))
 
     def test_size_limit(self):
         with self.assertRaises(ValueError):

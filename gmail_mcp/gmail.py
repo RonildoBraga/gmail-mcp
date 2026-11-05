@@ -70,7 +70,7 @@ def _extract_body(payload: dict, body_format: str = "text") -> str:
             html_body = _decode_part(part)
     if body_format == "html":
         return html_body or plain
-    return mailtext.best_text(plain, html_body)
+    return mailtext.best_text(plain, html_body, documents.html_text)
 
 
 def _is_inline(part: dict) -> bool:

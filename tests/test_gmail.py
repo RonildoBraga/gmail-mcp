@@ -1,6 +1,6 @@
 import base64
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from gmail_mcp import gmail, providers
 
@@ -32,6 +32,12 @@ class RenderThreadTests(unittest.TestCase):
     def test_html_only_mail_becomes_clean_text(self):
         message = self.rendered(part("text/html", "<style>x</style><p>Your order</p>"))
         self.assertEqual(message["body"], "Your order")
+
+    def test_very_large_html_is_converted_outside_the_server(self):
+        with patch.object(gmail.documents, "_LARGEST_IN_PROCESS_HTML", 4), \
+             patch.object(gmail.documents, "_run_worker", return_value={"text": "converted"}) as worker:
+            self.assertEqual(self.rendered(part("text/html", "<p>big</p>"))["body"], "converted")
+        worker.assert_called_once()
 
     def test_nested_plain_part_is_preferred(self):
         alternative = {"mimeType": "multipart/alternative",

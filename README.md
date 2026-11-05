@@ -221,8 +221,9 @@ entrypoint without starting authentication or the stdio server.
 - Without the key the stored credentials are unrecoverable, so you'd reconnect the
   accounts. A missing key stops with an error instead of creating a new one that
   couldn't decrypt them.
-- Attachments and Drive files are parsed in a short-lived child process with a
-  timeout, so a hostile file can't hang the server or reach decrypted tokens.
+- Attachments, Drive files and unusually large HTML bodies are parsed in a
+  short-lived child process with a timeout, so hostile content can't hang the
+  server or reach decrypted tokens.
   Saved files are private to the current user, stay inside the save folder whatever
   name the sender chose, and never replace an existing file.
 - Existing email/default selectors remain unchanged. Provider collisions are

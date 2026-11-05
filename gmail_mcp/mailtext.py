@@ -14,6 +14,8 @@ from __future__ import annotations
 import html
 import re
 import urllib.parse
+from collections import Counter
+from collections.abc import Callable
 from html.parser import HTMLParser
 
 DEFAULT_MAX_CHARS = 20_000
@@ -67,6 +69,9 @@ class _TextExtractor(HTMLParser):
         self.parts: list[str] = []
         # Each open element: tag, hidden, zero font size, link target, parts index.
         self._open: list[dict] = []
+        # Senders control this markup, so per-tag checks must not scan the stack:
+        # that makes deeply nested or unbalanced HTML quadratic.
+        self._open_counts: Counter[str] = Counter()
 
     def _visible(self) -> bool:
         top = self._open[-1] if self._open else None
@@ -89,15 +94,18 @@ class _TextExtractor(HTMLParser):
         elif tag in ("td", "th"):
             self.parts.append(" ")
         if tag not in _VOID_TAGS:
+            # Links can't nest, and following nested ones would re-read their text.
+            href = attributes.get("href") if tag == "a" and not self._open_counts["a"] else None
             self._open.append({"tag": tag, "hidden": hidden, "zero_font": zero_font,
-                               "href": attributes.get("href") if tag == "a" else None,
-                               "start": len(self.parts)})
+                               "href": href, "start": len(self.parts)})
+            self._open_counts[tag] += 1
 
     def handle_endtag(self, tag: str) -> None:
-        if not any(element["tag"] == tag for element in self._open):
+        if not self._open_counts[tag]:
             return
         while self._open:
             element = self._open.pop()
+            self._open_counts[element["tag"]] -= 1
             if element["tag"] == tag:
                 break
         if tag in _BLOCK_TAGS or tag == "li":
@@ -117,8 +125,7 @@ class _TextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self._visible():
             return
-        preformatted = any(element["tag"] == "pre" for element in self._open)
-        self.parts.append(data if preformatted else re.sub(r"\s+", " ", data))
+        self.parts.append(data if self._open_counts["pre"] else re.sub(r"\s+", " ", data))
 
 
 def html_to_text(source: str) -> str:
@@ -133,12 +140,12 @@ def html_to_text(source: str) -> str:
     return clean_text(html.unescape(re.sub(r"(?s)<[^>]+>", " ", source)))
 
 
-def best_text(plain: str, html_body: str) -> str:
+def best_text(plain: str, html_body: str, convert: Callable[[str], str] = html_to_text) -> str:
     """Prefer the plain part, unless it is only a stub for a fuller HTML part."""
     plain_text = clean_text(plain) if plain else ""
     if not html_body or len(plain_text) >= _SUBSTANTIAL_PLAIN_TEXT:
         return plain_text
-    html_text = html_to_text(html_body)
+    html_text = convert(html_body)
     return html_text if len(html_text) > len(plain_text) else plain_text
 
 
