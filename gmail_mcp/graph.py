@@ -8,12 +8,29 @@ a Graph *conversation* plays the role of a Gmail *thread*.
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 
 BASE = "https://graph.microsoft.com/v1.0"
+
+_SEARCH_TERM = re.compile(r"""
+    (?P<negated>-)?
+    (?:
+        (?P<field>[A-Za-z_]+):(?P<value>"[^"]*"|\([^()]*\)|[^\s()]+)
+      | (?P<phrase>"[^"]*")
+      | (?P<word>[^\s()"]+)
+      | (?P<opening>\()
+    )
+    | (?P<closing>\))
+""", re.VERBOSE)
+_GMAIL_ONLY_FIELDS = {"category", "deliveredto", "filename", "in", "label", "larger", "list",
+                      "rfc822msgid", "smaller"}
+_CONNECTORS = ("OR", "AND", "NOT")
+_DROPPED = object()
 
 
 class GraphError(RuntimeError):
@@ -167,16 +184,136 @@ def _summary(msg: dict) -> dict:
 _MSG_FIELDS = "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,body"
 
 
+def _search_date(value: str) -> str | None:
+    """Gmail dates are Y/M/D or M/D/Y. KQL needs ISO dates."""
+    for pattern in ("%Y/%m/%d", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return dt.datetime.strptime(value, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _relative_date(value: str) -> str | None:
+    match = re.fullmatch(r"(\d+)([dmy])", value.lower())
+    if not match:
+        return None
+    days = int(match[1]) * {"d": 1, "m": 30, "y": 365}[match[2]]
+    return (dt.date.today() - dt.timedelta(days=days)).isoformat()
+
+
+def _kql_for_field(field: str, value: str) -> str | None:
+    """KQL for one Gmail operator. None means Graph has no equivalent."""
+    name = field.lower()
+    if name in _GMAIL_ONLY_FIELDS:
+        return None
+    if name in ("after", "before"):
+        date = _search_date(value)
+        return date and f"received{'>=' if name == 'after' else '<'}{date}"
+    if name in ("newer_than", "older_than"):
+        date = _relative_date(value)
+        return date and f"received{'>=' if name == 'newer_than' else '<'}{date}"
+    if name == "has":
+        return "hasattachments:true" if value.lower() == "attachment" else None
+    if name == "is":
+        return {"unread": "isread:false", "read": "isread:true"}.get(value.lower())
+    return f"{field}:{value}"
+
+
+def _without_dropped_terms(tokens: list) -> list[str]:
+    """Remove dropped terms along with the operators that applied to them.
+
+    A negation or connector left behind would attach to the next surviving term
+    and change what the query means, so it goes with the term it belonged to.
+    """
+    tokens = list(tokens)
+    index = 0
+    while index < len(tokens):
+        before = tokens[index - 1] if index else None
+        after = tokens[index + 1] if index + 1 < len(tokens) else None
+        if tokens[index] == ")" and before == "(":
+            tokens[index - 1:index + 1] = [_DROPPED]
+            index -= 1
+        elif tokens[index] is not _DROPPED:
+            index += 1
+        elif before == "NOT":
+            del tokens[index - 1]
+            index -= 1
+        elif before == "(" and after == ")":
+            tokens[index - 1:index + 2] = [_DROPPED]
+            index -= 1
+        elif before in ("OR", "AND"):
+            del tokens[index - 1:index + 1]
+            index -= 1
+        elif after in ("OR", "AND"):
+            del tokens[index:index + 2]
+        else:
+            del tokens[index]
+    return tokens
+
+
+def _render_kql(tokens: list) -> str:
+    """Join tokens into a query, leaving no dangling connector at either end."""
+    tokens = _without_dropped_terms(tokens)
+    while tokens and tokens[-1] in _CONNECTORS:
+        tokens.pop()
+    while tokens and tokens[0] in ("OR", "AND"):
+        tokens.pop(0)
+    text = ""
+    for token in tokens:
+        if text and token != ")" and not text.endswith("("):
+            text += " "
+        text += token
+    return text
+
+
+def gmail_query_to_kql(query: str) -> tuple[str, list[str]]:
+    """Translate Gmail search syntax for Graph `$search`.
+
+    Graph treats an operator it doesn't know, such as `after:` or `label:`, as a
+    term no message can match, so an untranslated query silently finds nothing.
+    Terms with no Graph equivalent are returned so callers can report them.
+    """
+    tokens: list = []
+    ignored: list[str] = []
+    for match in _SEARCH_TERM.finditer(query):
+        if match["closing"]:
+            tokens.append(")")
+            continue
+        negated = bool(match["negated"])
+        if match["opening"]:
+            tokens.extend(["NOT", "("] if negated else ["("])
+            continue
+        if match["field"]:
+            term = _kql_for_field(match["field"], match["value"])
+            if term is None:
+                ignored.append(match[0])
+                tokens.append(_DROPPED)
+                continue
+        else:
+            term = match["phrase"] or match["word"]
+        tokens.extend(["NOT", term] if negated else [term])
+    return _render_kql(tokens), ignored
+
+
 def search_threads(token: str, query: str, top: int, page_token: str | None = None,
                    *, account: str = "") -> dict:
     """Search the mailbox. Uses Graph $search when a query is given, else recent mail."""
+    ignored: list[str] = []
     if query and query.strip():
-        q = urllib.parse.quote(f'"{query}"')
+        kql, ignored = gmail_query_to_kql(query)
+        if not kql:
+            return {"threads": [], "next_page_token": None, "ignored_terms": ignored}
+        escaped = kql.replace("\\", "\\\\").replace('"', '\\"')
+        q = urllib.parse.quote(f'"{escaped}"')
         path = f"/me/messages?$search={q}&$top={min(_limit(top), 1000)}&$select={_MSG_FIELDS.removesuffix(',body')}"
     else:
         path = f"/me/messages?$top={min(_limit(top), 1000)}&$orderby=receivedDateTime desc&$select={_MSG_FIELDS.removesuffix(',body')}"
     items, next_token = _bounded_items(token, path, top, page_token, f"search:{account}:{query}")
-    return {"threads": [_summary(m) for m in items], "next_page_token": next_token}
+    result = {"threads": [_summary(m) for m in items], "next_page_token": next_token}
+    if ignored:
+        result["ignored_terms"] = ignored
+    return result
 
 
 def get_thread(token: str, conversation_id: str) -> dict:

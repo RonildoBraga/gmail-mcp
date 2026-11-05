@@ -118,8 +118,11 @@ conversation between mail folders (well-known `Archive` / `Junk Email` /
 `Deleted Items`, or a custom folder created on demand). Prefer a custom folder
 over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
 
-Search syntax: Gmail uses Gmail query syntax (`is:unread from:a@b.com`);
-Microsoft treats the query as free-text `$search`.
+Search syntax: use Gmail query syntax for every account (`is:unread from:a@b.com`).
+Microsoft accounts translate it for Graph `$search`: `after:`, `before:`,
+`newer_than:`, `older_than:`, `has:attachment`, `is:read`, `is:unread` and `-term`
+all work, and quoted phrases are safe. Operators with no Graph equivalent, such as
+`label:` and `category:`, are dropped and listed in the result's `ignored_terms`.
 
 Search, draft lists and Drive lists/searches honor `max_results`, fill short API
 pages, and return `next_page_token` (`null` when finished). Pass it back as
@@ -195,8 +198,16 @@ entrypoint without starting authentication or the stdio server.
 - Each account's credentials live in **one Fernet-encrypted `auth_data` blob**
   (Google refresh token / MSAL token cache) — no secret material in the clear.
 - `client_secret.json`, `accounts.db`, `fernet.key` are gitignored — never commit.
-- Back up `fernet.key` alongside `accounts.db`; without the key the stored
-  credentials are unrecoverable (you'd just re-connect the accounts).
+- The store keeps `credentials/` and `backups/` private to the current user
+  (folders `0700`, files `0600`) and tightens wider permissions when it opens.
+- On macOS the encryption key belongs in the Keychain, so copying the credentials
+  folder isn't enough to read the tokens. New stores put it there automatically.
+  An existing store moves with `python -m gmail_mcp.keystore migrate --remove-file`,
+  which verifies the key against every stored account before deleting the file.
+  Elsewhere the key stays in `fernet.key`; back it up apart from `accounts.db`.
+- Without the key the stored credentials are unrecoverable, so you'd reconnect the
+  accounts. A missing key stops with an error instead of creating a new one that
+  couldn't decrypt them.
 - Existing email/default selectors remain unchanged. Provider collisions are
   rejected in either direction, including case variants. Use a distinct Microsoft
   alias when its primary address is already stored as Google.

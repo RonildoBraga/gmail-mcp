@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
@@ -217,7 +218,7 @@ class KeyPublicationTests(unittest.TestCase):
                 barrier.wait(timeout=3)
                 return generate_key()
 
-            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"):
+            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"), patch.object(store, "DB_PATH", root / "accounts.db"):
                 with patch.object(Fernet, "generate_key", side_effect=concurrent_key):
                     with ThreadPoolExecutor(max_workers=4) as executor:
                         keys = list(executor.map(lambda _: store._load_fernet(), range(4)))
@@ -229,11 +230,135 @@ class KeyPublicationTests(unittest.TestCase):
     def test_failed_publication_cleans_temporary_file(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"):
+            with patch.object(store, "CRED_DIR", root), patch.object(store, "KEY_PATH", root / "fernet.key"), patch.object(store, "DB_PATH", root / "accounts.db"):
                 with patch.object(store.os, "link", side_effect=OSError("disk error")):
                     with self.assertRaisesRegex(OSError, "disk error"):
                         store._load_fernet()
                 self.assertEqual(list(root.iterdir()), [])
+
+
+class CredentialProtectionTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name) / "credentials"
+        self.key_path = self.root / "fernet.key"
+        self.enterContext(patch.object(store, "CRED_DIR", self.root))
+        self.enterContext(patch.object(store, "DB_PATH", self.root / "accounts.db"))
+        self.enterContext(patch.object(store, "KEY_PATH", self.key_path))
+
+    def mode(self, path):
+        return stat.S_IMODE(path.stat().st_mode)
+
+    def test_new_store_is_private_to_the_user(self):
+        store.AccountStore()
+        self.assertEqual(self.mode(self.root), 0o700)
+        self.assertEqual(self.mode(store.DB_PATH), 0o600)
+        self.assertEqual(self.mode(self.key_path), 0o600)
+
+    def test_existing_loose_permissions_are_tightened(self):
+        store.AccountStore()
+        self.root.chmod(0o755)
+        store.DB_PATH.chmod(0o644)
+        self.key_path.chmod(0o644)
+        secret = self.root / "client_secret.json"
+        secret.write_text("{}")
+        secret.chmod(0o644)
+        backups = self.root.parent / "backups"
+        backups.mkdir()
+        backup = backups / "accounts.db.old"
+        backup.write_text("old")
+        backup.chmod(0o644)
+        store.harden_credentials()
+        for path in (store.DB_PATH, self.key_path, secret, backup):
+            self.assertEqual(self.mode(path), 0o600, path.name)
+        self.assertEqual(self.mode(self.root), 0o700)
+        self.assertEqual(self.mode(backups), 0o700)
+
+    def test_tightening_never_widens_access(self):
+        self.root.mkdir(mode=0o700)
+        narrow = self.root / "narrow"
+        narrow.write_text("x")
+        narrow.chmod(0o400)
+        store.harden_credentials()
+        self.assertEqual(self.mode(narrow), 0o400)
+
+    def test_missing_key_never_replaces_keys_for_stored_accounts(self):
+        accounts = store.AccountStore()
+        accounts.upsert("a@example.com", "google", {"refresh_token": "secret"})
+        self.key_path.unlink()
+        with self.assertRaises(store.MissingKeyError):
+            store._load_fernet()
+        self.assertFalse(self.key_path.exists())
+
+    def test_store_without_accounts_can_start_again_after_losing_its_key(self):
+        store.AccountStore()
+        self.key_path.unlink()
+        store.AccountStore()
+        self.assertTrue(self.key_path.exists())
+
+
+class KeychainSelectionTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.key_path = self.root / "fernet.key"
+        self.enterContext(patch.object(store, "CRED_DIR", self.root))
+        self.enterContext(patch.object(store, "DB_PATH", self.root / "accounts.db"))
+        self.enterContext(patch.object(store, "KEY_PATH", self.key_path))
+        self.enterContext(patch.object(store, "_DEFAULT_KEY_PATH", self.key_path))
+        self.enterContext(patch.object(store.keystore, "available", return_value=True))
+        self.vault = {}
+
+    def fake_keychain(self):
+        def add(key):
+            return self.vault.setdefault("key", key) == key
+        return (patch.object(store.keystore, "read", side_effect=lambda: self.vault.get("key")),
+                patch.object(store.keystore, "add", side_effect=add))
+
+    def test_keychain_key_wins_over_key_file(self):
+        self.vault["key"] = Fernet.generate_key()
+        self.key_path.write_bytes(Fernet.generate_key())
+        reader, writer = self.fake_keychain()
+        with reader, writer:
+            loaded = store._load_fernet()
+        self.assertEqual(Fernet(self.vault["key"]).decrypt(loaded.encrypt(b"x")), b"x")
+
+    def test_new_store_creates_its_key_in_the_keychain_only(self):
+        reader, writer = self.fake_keychain()
+        with reader, writer:
+            loaded = store._load_fernet()
+        self.assertEqual(Fernet(self.vault["key"]).decrypt(loaded.encrypt(b"x")), b"x")
+        self.assertFalse(self.key_path.exists())
+
+    def test_key_file_keeps_working_until_migrated(self):
+        key = Fernet.generate_key()
+        self.key_path.write_bytes(key)
+        reader, writer = self.fake_keychain()
+        with reader, writer:
+            loaded = store._load_fernet()
+        self.assertEqual(Fernet(key).decrypt(loaded.encrypt(b"x")), b"x")
+        self.assertEqual(self.vault, {})
+
+    def test_locked_keychain_falls_back_to_an_existing_key_file(self):
+        key = Fernet.generate_key()
+        self.key_path.write_bytes(key)
+        with patch.object(store.keystore, "read", side_effect=store.keystore.KeychainError("locked")):
+            loaded = store._load_fernet()
+        self.assertEqual(Fernet(key).decrypt(loaded.encrypt(b"x")), b"x")
+
+    def test_locked_keychain_without_a_key_file_stops(self):
+        with patch.object(store.keystore, "read", side_effect=store.keystore.KeychainError("locked")):
+            with self.assertRaises(store.keystore.KeychainError):
+                store._load_fernet()
+
+    def test_other_store_locations_never_touch_the_keychain(self):
+        with patch.object(store, "KEY_PATH", self.root / "other.key"):
+            with patch.object(store.keystore, "read") as reader, patch.object(store.keystore, "add") as writer:
+                store._load_fernet()
+        reader.assert_not_called()
+        writer.assert_not_called()
 
 
 if __name__ == "__main__":
