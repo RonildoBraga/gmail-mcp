@@ -118,8 +118,11 @@ conversation between mail folders (well-known `Archive` / `Junk Email` /
 `Deleted Items`, or a custom folder created on demand). Prefer a custom folder
 over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
 
-Search syntax: Gmail uses Gmail query syntax (`is:unread from:a@b.com`);
-Microsoft treats the query as free-text `$search`.
+Search syntax: use Gmail query syntax for every account (`is:unread from:a@b.com`).
+Microsoft accounts translate it for Graph `$search`: `after:`, `before:`,
+`newer_than:`, `older_than:`, `has:attachment`, `is:read`, `is:unread` and `-term`
+all work, and quoted phrases are safe. Operators with no Graph equivalent, such as
+`label:` and `category:`, are dropped and listed in the result's `ignored_terms`.
 
 Search, draft lists and Drive lists/searches honor `max_results`, fill short API
 pages, and return `next_page_token` (`null` when finished). Pass it back as

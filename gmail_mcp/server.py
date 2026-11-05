@@ -110,12 +110,14 @@ def get_thread(thread_id: str, account: str | None = None) -> dict:
 @mcp.tool(annotations=READ_ONLY)
 def search_all_threads(query: str, max_results: int = 10) -> dict:
     """Search EVERY connected account at once (Gmail + Microsoft). Each result is tagged."""
-    out, errors, continuations = [], {}, {}
+    out, errors, continuations, ignored = [], {}, {}, {}
     for email in auth.store().list_emails():
         try:
             res = provider_for(email).search_threads(query, max_results)
             if res.get("next_page_token"):
                 continuations[email] = res["next_page_token"]
+            if res.get("ignored_terms"):
+                ignored[email] = res["ignored_terms"]
             for t in res["threads"]:
                 t["account"] = email
                 out.append(t)
@@ -126,6 +128,8 @@ def search_all_threads(query: str, max_results: int = 10) -> dict:
         result["errors"] = errors
     if continuations:
         result["next_page_tokens"] = continuations
+    if ignored:
+        result["ignored_terms"] = ignored
     return result
 
 
