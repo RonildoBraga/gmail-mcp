@@ -15,7 +15,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import documents, mailtext
+
 BASE = "https://graph.microsoft.com/v1.0"
+_PLAIN_BODIES = 'outlook.body-content-type="text"'
+_HTML_BODIES = 'outlook.body-content-type="html"'
 
 _SEARCH_TERM = re.compile(r"""
     (?P<negated>-)?
@@ -64,18 +68,17 @@ def _url(path: str) -> str:
     return url.replace(" ", "%20")
 
 
-def _request(token: str, method: str, path: str, body: dict | None = None) -> dict:
+def _send(token: str, method: str, path: str, body: dict | None, prefer: str,
+          *, limit: int | None = None) -> bytes:
     url = _url(path)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_unredirected_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
-    # Ask Graph to return plain-text bodies instead of HTML where possible.
-    req.add_header("Prefer", 'outlook.body-content-type="text"')
+    req.add_header("Prefer", prefer)
     try:
         with _OPENER.open(req, timeout=30) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+            return resp.read() if limit is None else resp.read(limit)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         guidance = (
@@ -87,7 +90,13 @@ def _request(token: str, method: str, path: str, body: dict | None = None) -> di
         ) from None
 
 
-def _all_items(token: str, path: str) -> list[dict]:
+def _request(token: str, method: str, path: str, body: dict | None = None,
+             *, prefer: str = _PLAIN_BODIES) -> dict:
+    raw = _send(token, method, path, body, prefer)
+    return json.loads(raw) if raw else {}
+
+
+def _all_items(token: str, path: str, *, prefer: str = _PLAIN_BODIES) -> list[dict]:
     """Exhaust a Graph collection; never return a silently truncated result."""
     items, seen = [], set()
     while path:
@@ -95,7 +104,7 @@ def _all_items(token: str, path: str) -> list[dict]:
         if url in seen:
             raise RuntimeError("Graph pagination loop detected")
         seen.add(url)
-        response = _request(token, "GET", path)
+        response = _request(token, "GET", path, prefer=prefer)
         items.extend(response.get("value", []))
         path = response.get("@odata.nextLink")
     return items
@@ -176,12 +185,17 @@ def _summary(msg: dict) -> dict:
         "from": _addr(msg.get("from")),
         "date": msg.get("receivedDateTime"),
         "message_count": None,  # unknown without fetching the whole conversation
-        "snippet": msg.get("bodyPreview"),
+        "snippet": _clean_preview(msg.get("bodyPreview")),
         "message_id": msg.get("id"),
     }
 
 
-_MSG_FIELDS = "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,body"
+def _clean_preview(preview: str | None) -> str | None:
+    return mailtext.clean_text(preview) if preview else preview
+
+
+_MSG_FIELDS = ("id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
+               "bodyPreview,hasAttachments,body")
 
 
 def _search_date(value: str) -> str | None:
@@ -316,25 +330,61 @@ def search_threads(token: str, query: str, top: int, page_token: str | None = No
     return result
 
 
-def get_thread(token: str, conversation_id: str) -> dict:
-    """Fetch every message in a conversation, decoded."""
+def _attachment_path(message_id: str, attachment_id: str | None = None) -> str:
+    path = f"/me/messages/{urllib.parse.quote(message_id, safe='')}/attachments"
+    return path if attachment_id is None else f"{path}/{urllib.parse.quote(attachment_id, safe='')}"
+
+
+def list_attachments(token: str, message_id: str) -> list[dict]:
+    """Files a reader would call attachments, leaving out embedded logos."""
+    path = f"{_attachment_path(message_id)}?$select=id,name,contentType,size,isInline"
+    listed = []
+    for item in _all_items(token, path):
+        mime = item.get("contentType") or "application/octet-stream"
+        size = item.get("size") or 0
+        if not documents.is_decorative(mime, size, bool(item.get("isInline"))):
+            listed.append({"attachment_id": item.get("id"), "filename": item.get("name"),
+                           "mime_type": mime, "size": size})
+    return listed
+
+
+def get_attachment(token: str, message_id: str, attachment_id: str) -> dict:
+    path = _attachment_path(message_id, attachment_id)
+    meta = _request(token, "GET", f"{path}?$select=id,name,contentType,size")
+    documents.check_size(meta.get("size") or 0)
+    data = _send(token, "GET", f"{path}/$value", None, _PLAIN_BODIES, limit=documents.MAX_BYTES + 1)
+    documents.check_size(len(data))
+    return {"filename": meta.get("name") or "attachment",
+            "mime_type": meta.get("contentType") or "application/octet-stream", "data": data}
+
+
+def get_thread(token: str, conversation_id: str, *, body_format: str = "text",
+               max_chars: int = mailtext.DEFAULT_MAX_CHARS) -> dict:
+    """Fetch every message in a conversation, with clean bodies and attachments."""
+    mailtext.check_body_format(body_format)
     cid = urllib.parse.quote(conversation_id.replace("'", "''"), safe="")
     # Graph rejects $orderby alongside a conversationId $filter
     # ("InefficientFilter"), so fetch unsorted and sort client-side below.
     path = f"/me/messages?$filter=conversationId eq '{cid}'&$select={_MSG_FIELDS}"
+    prefer = _HTML_BODIES if body_format == "html" else _PLAIN_BODIES
     messages = []
-    for m in _all_items(token, path):
-        messages.append(
-            {
-                "message_id": m.get("id"),
-                "from": _addr(m.get("from")),
-                "to": _addr_list(m.get("toRecipients")),
-                "subject": m.get("subject"),
-                "date": m.get("receivedDateTime"),
-                "snippet": m.get("bodyPreview"),
-                "body": (m.get("body") or {}).get("content", ""),
-            }
-        )
+    for m in _all_items(token, path, prefer=prefer):
+        content = (m.get("body") or {}).get("content", "")
+        text = mailtext.clean_text(content) if body_format == "text" else content
+        body, truncated = mailtext.limit(text, max_chars)
+        message = {
+            "message_id": m.get("id"),
+            "from": _addr(m.get("from")),
+            "to": _addr_list(m.get("toRecipients")),
+            "subject": m.get("subject"),
+            "date": m.get("receivedDateTime"),
+            "snippet": _clean_preview(m.get("bodyPreview")),
+            "body": body,
+            "attachments": list_attachments(token, m["id"]) if m.get("hasAttachments") else [],
+        }
+        if truncated:
+            message["body_truncated"] = True
+        messages.append(message)
     messages.sort(key=lambda m: m.get("date") or "")
     return {"thread_id": conversation_id, "messages": messages}
 

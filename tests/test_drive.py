@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 from gmail_mcp import drive
 
@@ -27,6 +27,55 @@ class DrivePaginationTests(unittest.TestCase):
         for value in (0, -1, True, "2"):
             with self.assertRaises(ValueError):
                 drive.list_files(svc, value)
+
+
+class ReadContentTests(unittest.TestCase):
+    def read(self, meta):
+        service = MagicMock()
+        service.files.return_value.get.return_value.execute.return_value = meta
+        return service
+
+    def test_pdfs_are_read_as_text(self):
+        service = self.read({"name": "bill.pdf", "mimeType": "application/pdf", "size": "9"})
+        extracted = {"text": "Invoice", "pages": 1}
+        with patch.object(drive, "_download", return_value=b"%PDF"), \
+             patch.object(drive.documents, "extract_text", return_value=extracted) as extract:
+            result = drive.read_content(service, "f1")
+        extract.assert_called_once_with(b"%PDF", "bill.pdf", "application/pdf")
+        self.assertEqual((result["text"], result["pages"], result["truncated"]), ("Invoice", 1, False))
+
+    def test_unreadable_files_return_a_note(self):
+        service = self.read({"name": "a.png", "mimeType": "image/png", "size": "9"})
+        extracted = {"text": None, "note": "no"}
+        with patch.object(drive, "_download", return_value=b"x"), \
+             patch.object(drive.documents, "extract_text", return_value=extracted):
+            result = drive.read_content(service, "f1")
+        self.assertIsNone(result["text"])
+        self.assertEqual(result["note"], "no")
+
+    def test_google_files_are_exported(self):
+        service = self.read({"name": "Doc", "mimeType": "application/vnd.google-apps.document"})
+        service.files.return_value.export.return_value.execute.return_value = b"hello"
+        self.assertEqual(drive.read_content(service, "f1")["text"], "hello")
+
+    def test_google_types_without_an_export_are_explained(self):
+        service = self.read({"name": "Form", "mimeType": "application/vnd.google-apps.form"})
+        result = drive.read_content(service, "f1")
+        self.assertIsNone(result["text"])
+        self.assertIn("exported", result["note"])
+
+    def test_long_text_is_cut_and_flagged(self):
+        service = self.read({"name": "Doc", "mimeType": "application/vnd.google-apps.document"})
+        service.files.return_value.export.return_value.execute.return_value = b"abcdef"
+        result = drive.read_content(service, "f1", max_chars=3)
+        self.assertEqual((result["text"], result["truncated"]), ("abc", True))
+
+    def test_oversized_files_are_refused_before_download(self):
+        size = str(drive.documents.MAX_BYTES + 1)
+        service = self.read({"name": "big.pdf", "mimeType": "application/pdf", "size": size})
+        with patch.object(drive, "_download") as download, self.assertRaises(ValueError):
+            drive.read_content(service, "f1")
+        download.assert_not_called()
 
 
 if __name__ == "__main__":

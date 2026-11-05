@@ -7,7 +7,10 @@ this module is just the mapping logic the GmailProvider reuses.
 from __future__ import annotations
 
 import base64
+import html
 from email.message import EmailMessage
+
+from . import documents, mailtext
 
 
 def _header(headers: list[dict], name: str) -> str | None:
@@ -31,49 +34,101 @@ def thread_summary(svc, thread_id: str) -> dict:
         "from": _header(first_headers, "From"),
         "date": _header(first_headers, "Date"),
         "message_count": len(msgs),
-        "snippet": msgs[0].get("snippet") if msgs else None,
+        "snippet": _clean_snippet(msgs[0].get("snippet")) if msgs else None,
     }
+
+
+def _clean_snippet(snippet: str | None) -> str | None:
+    return mailtext.clean_text(html.unescape(snippet)) if snippet else snippet
+
+
+def decode_data(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 def _decode_part(part: dict) -> str:
     data = part.get("body", {}).get("data")
-    return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace") if data else ""
+    return decode_data(data).decode("utf-8", errors="replace") if data else ""
 
 
-def _extract_body(payload: dict) -> str:
-    """Walk a MIME tree and return the best text body (prefers text/plain)."""
-    mime = payload.get("mimeType", "")
-    if mime == "text/plain":
-        return _decode_part(payload)
-    if mime.startswith("multipart/"):
-        parts = payload.get("parts", [])
-        plain = next((p for p in parts if p.get("mimeType") == "text/plain"), None)
-        if plain:
-            return _decode_part(plain)
-        for p in parts:
-            body = _extract_body(p)
-            if body:
-                return body
-    if mime == "text/html":
-        return _decode_part(payload)
-    return ""
+def _walk(payload: dict):
+    yield payload
+    for part in payload.get("parts") or []:
+        yield from _walk(part)
 
 
-def render_thread(thread: dict) -> dict:
-    """Full thread with per-message headers and decoded bodies."""
+def _extract_body(payload: dict, body_format: str = "text") -> str:
+    """Return a message's body as clean text, or as its original HTML."""
+    plain = html_body = ""
+    for part in _walk(payload):
+        if part.get("filename"):
+            continue
+        mime = part.get("mimeType", "")
+        if mime == "text/plain" and not plain:
+            plain = _decode_part(part)
+        elif mime == "text/html" and not html_body:
+            html_body = _decode_part(part)
+    if body_format == "html":
+        return html_body or plain
+    return mailtext.best_text(plain, html_body, documents.html_text)
+
+
+def _is_inline(part: dict) -> bool:
+    disposition = _header(part.get("headers", []), "Content-Disposition") or ""
+    return disposition.lower().startswith("inline")
+
+
+def _attachment_parts(payload: dict) -> list[dict]:
+    parts = []
+    for part in _walk(payload):
+        body = part.get("body", {})
+        if part.get("filename") and (body.get("attachmentId") or body.get("data")):
+            parts.append(part)
+    return parts
+
+
+def list_attachments(payload: dict) -> list[dict]:
+    """Files a reader would call attachments, leaving out embedded logos."""
+    listed = []
+    for part in _attachment_parts(payload):
+        mime = part.get("mimeType", "application/octet-stream")
+        size = part["body"].get("size", 0)
+        if not documents.is_decorative(mime, size, _is_inline(part)):
+            listed.append({"attachment_id": part.get("partId"), "filename": part["filename"],
+                           "mime_type": mime, "size": size})
+    return listed
+
+
+def find_attachment(payload: dict, attachment_id: str) -> dict:
+    # Gmail's own attachment ids change between fetches, but part ids don't.
+    for part in _attachment_parts(payload):
+        if part.get("partId") == attachment_id:
+            return part
+    raise ValueError(f"No attachment {attachment_id!r} in this message.")
+
+
+def render_thread(thread: dict, *, body_format: str = "text",
+                  max_chars: int = mailtext.DEFAULT_MAX_CHARS) -> dict:
+    """Full thread with per-message headers, bodies and attachments."""
+    mailtext.check_body_format(body_format)
     messages = []
     for m in thread.get("messages", []):
         headers = m["payload"].get("headers", [])
-        messages.append({
+        body, truncated = mailtext.limit(_extract_body(m["payload"], body_format), max_chars)
+        message = {
             "message_id": m["id"],
             "from": _header(headers, "From"),
             "to": _header(headers, "To"),
             "subject": _header(headers, "Subject"),
             "date": _header(headers, "Date"),
-            "snippet": m.get("snippet"),
-            "body": _extract_body(m["payload"]),
+            "snippet": _clean_snippet(m.get("snippet")),
+            "body": body,
             "label_ids": m.get("labelIds", []),
-        })
+            "attachments": list_attachments(m["payload"]),
+        }
+        if truncated:
+            message["body_truncated"] = True
+        messages.append(message)
     return {"thread_id": thread.get("id"), "messages": messages}
 
 

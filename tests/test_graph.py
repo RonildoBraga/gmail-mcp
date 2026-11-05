@@ -211,5 +211,75 @@ class SearchTranslationTests(unittest.TestCase):
         self.assertNotIn("ignored_terms", result)
 
 
+class GraphMessageTests(unittest.TestCase):
+    def thread(self, message, attachments=(), **options):
+        pages = [{"value": [message]}, {"value": list(attachments)}]
+        with patch.object(graph, "_request", side_effect=pages) as request:
+            return graph.get_thread("token", "c1", **options)["messages"][0], request
+
+    def test_bodies_and_previews_are_cleaned(self):
+        message, _ = self.thread({"id": "1", "bodyPreview": "Hi\u034f there",
+                                  "body": {"content": "Hello\u200b   you\r\n\r\n\r\n\r\nBye"}})
+        self.assertEqual(message["body"], "Hello you\n\nBye")
+        self.assertEqual(message["snippet"], "Hi there")
+
+    def test_text_is_requested_by_default_and_html_on_demand(self):
+        _, request = self.thread({"id": "1"})
+        self.assertEqual(request.call_args_list[0].kwargs["prefer"], 'outlook.body-content-type="text"')
+        message, request = self.thread({"id": "1", "body": {"content": "<p>x</p>"}}, body_format="html")
+        self.assertEqual(request.call_args_list[0].kwargs["prefer"], 'outlook.body-content-type="html"')
+        self.assertEqual(message["body"], "<p>x</p>")
+
+    def test_long_bodies_are_cut_and_flagged(self):
+        message, _ = self.thread({"id": "1", "body": {"content": "x" * 50}}, max_chars=10)
+        self.assertEqual(len(message["body"]), 10)
+        self.assertTrue(message["body_truncated"])
+
+    def test_messages_without_attachments_need_no_extra_request(self):
+        message, request = self.thread({"id": "1", "hasAttachments": False})
+        self.assertEqual(message["attachments"], [])
+        self.assertEqual(request.call_count, 1)
+
+    def test_attachments_are_listed_without_embedded_logos(self):
+        message, _ = self.thread({"id": "m/1", "hasAttachments": True}, [
+            {"id": "a1", "name": "bill.pdf", "contentType": "application/pdf", "size": 9000, "isInline": False},
+            {"id": "a2", "name": "logo.png", "contentType": "image/png", "size": 4000, "isInline": True},
+        ])
+        self.assertEqual(message["attachments"], [
+            {"attachment_id": "a1", "filename": "bill.pdf", "mime_type": "application/pdf", "size": 9000}])
+
+    def test_attachment_paths_escape_ids(self):
+        self.assertEqual(graph._attachment_path("m/1=", "a/2"), "/me/messages/m%2F1%3D/attachments/a%2F2")
+
+    def test_downloads_the_raw_attachment_bytes(self):
+        meta = {"name": "bill.pdf", "contentType": "application/pdf", "size": 3}
+        with patch.object(graph, "_request", return_value=meta), \
+             patch.object(graph, "_send", return_value=b"pdf") as send:
+            result = graph.get_attachment("token", "m1", "a1")
+        self.assertEqual(result, {"filename": "bill.pdf", "mime_type": "application/pdf", "data": b"pdf"})
+        self.assertTrue(send.call_args.args[2].endswith("/attachments/a1/$value"))
+
+    def test_oversized_attachment_is_refused_before_download(self):
+        meta = {"name": "big.pdf", "size": graph.documents.MAX_BYTES + 1}
+        with patch.object(graph, "_request", return_value=meta), patch.object(graph, "_send") as send:
+            with self.assertRaises(ValueError):
+                graph.get_attachment("token", "m1", "a1")
+        send.assert_not_called()
+
+    def test_download_size_is_checked_even_when_metadata_understates_it(self):
+        big = b"x" * (graph.documents.MAX_BYTES + 1)
+        with patch.object(graph, "_request", return_value={"size": 1}), \
+             patch.object(graph, "_send", return_value=big):
+            with self.assertRaises(ValueError):
+                graph.get_attachment("token", "m1", "a1")
+
+    def test_requests_read_no_more_than_the_limit(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"data"
+        with patch.object(graph._OPENER, "open", return_value=response):
+            graph._send("secret", "GET", "/me/messages/1/attachments/2/$value", None, "x", limit=9)
+        response.__enter__.return_value.read.assert_called_once_with(9)
+
+
 if __name__ == "__main__":
     unittest.main()
