@@ -117,5 +117,49 @@ class GmailAttachmentTests(unittest.TestCase):
         self.messages.attachments.assert_not_called()
 
 
+class AutoDeletingLabelTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = providers.GmailProvider.__new__(providers.GmailProvider)
+        self.provider.email = "a@example.com"
+        self.provider.svc = MagicMock()
+        users = self.provider.svc.users.return_value
+        self.threads = users.threads.return_value
+        self.labels = users.labels.return_value
+        self.labels.list.return_value.execute.return_value = {"labels": [
+            {"id": "TRASH", "name": "TRASH"},
+            {"id": "SPAM", "name": "SPAM"},
+            {"id": "Label_1", "name": "Junk"},
+        ]}
+
+    def test_labelling_never_applies_trash_or_spam(self):
+        for label in ("TRASH", "SPAM", "trash", " Spam "):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "30 days"):
+                self.provider.modify_labels("t1", add=["Label_1", label], remove=[])
+        self.threads.modify.assert_not_called()
+
+    def test_moving_to_trash_or_spam_is_refused_without_creating_a_label(self):
+        for folder in ("Trash", "spam"):
+            with self.subTest(folder=folder), self.assertRaisesRegex(ValueError, "30 days"):
+                self.provider.move_thread("t1", folder)
+        self.threads.modify.assert_not_called()
+        self.labels.create.assert_not_called()
+
+    def test_custom_labels_and_restoring_from_trash_still_reach_gmail(self):
+        self.provider.modify_labels("t1", add=["Label_1"], remove=["TRASH", "SPAM"])
+        self.threads.modify.assert_called_once_with(
+            userId="me", id="t1",
+            body={"addLabelIds": ["Label_1"], "removeLabelIds": ["TRASH", "SPAM"]},
+        )
+
+    def test_filing_under_a_custom_label_and_archiving_still_work(self):
+        self.provider.move_thread("t1", "Junk")
+        self.provider.archive_thread("t2")
+        bodies = [call.kwargs["body"] for call in self.threads.modify.call_args_list]
+        self.assertEqual(bodies, [
+            {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            {"addLabelIds": [], "removeLabelIds": ["INBOX"]},
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

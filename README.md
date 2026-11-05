@@ -118,6 +118,9 @@ labels (remove `INBOX`; a folder name maps to a label), Outlook moves the
 conversation between mail folders (well-known `Archive` / `Junk Email` /
 `Deleted Items`, or a custom folder created on demand). Prefer a custom folder
 over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
+`label_thread` and `move_thread` refuse Gmail's `TRASH` and `SPAM` labels, because
+Gmail deletes that mail after 30 days. Use a custom label or archive the thread
+instead.
 
 `get_thread` returns readable text by default, so a marketing email costs a
 fraction of its raw size. Hidden content and invisible characters are removed, and
