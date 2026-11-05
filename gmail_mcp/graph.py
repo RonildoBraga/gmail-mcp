@@ -23,12 +23,14 @@ _SEARCH_TERM = re.compile(r"""
         (?P<field>[A-Za-z_]+):(?P<value>"[^"]*"|\([^()]*\)|[^\s()]+)
       | (?P<phrase>"[^"]*")
       | (?P<word>[^\s()"]+)
+      | (?P<opening>\()
     )
-    | (?P<bracket>[()])
+    | (?P<closing>\))
 """, re.VERBOSE)
 _GMAIL_ONLY_FIELDS = {"category", "deliveredto", "filename", "in", "label", "larger", "list",
                       "rfc822msgid", "smaller"}
 _CONNECTORS = ("OR", "AND", "NOT")
+_DROPPED = object()
 
 
 class GraphError(RuntimeError):
@@ -218,28 +220,51 @@ def _kql_for_field(field: str, value: str) -> str | None:
     return f"{field}:{value}"
 
 
-def _render_kql(tokens: list[str]) -> str:
-    """Join tokens, dropping connectors and brackets left empty by removed terms."""
-    settled = False
-    while not settled:
-        settled = True
-        kept: list[str] = []
-        for token in tokens:
-            if token == ")" and kept and (kept[-1] == "(" or kept[-1] in _CONNECTORS):
-                closes_empty_group = kept.pop() == "("
-                settled = False
-                if closes_empty_group:
-                    continue
-            if token in ("OR", "AND") and (not kept or kept[-1] in ("(", *_CONNECTORS)):
-                settled = False
-                continue
-            kept.append(token)
-        while kept and kept[-1] in _CONNECTORS:
-            kept.pop()
-            settled = False
-        tokens = kept
-    text = " ".join(tokens)
-    return text.replace("( ", "(").replace(" )", ")")
+def _without_dropped_terms(tokens: list) -> list[str]:
+    """Remove dropped terms along with the operators that applied to them.
+
+    A negation or connector left behind would attach to the next surviving term
+    and change what the query means, so it goes with the term it belonged to.
+    """
+    tokens = list(tokens)
+    index = 0
+    while index < len(tokens):
+        before = tokens[index - 1] if index else None
+        after = tokens[index + 1] if index + 1 < len(tokens) else None
+        if tokens[index] == ")" and before == "(":
+            tokens[index - 1:index + 1] = [_DROPPED]
+            index -= 1
+        elif tokens[index] is not _DROPPED:
+            index += 1
+        elif before == "NOT":
+            del tokens[index - 1]
+            index -= 1
+        elif before == "(" and after == ")":
+            tokens[index - 1:index + 2] = [_DROPPED]
+            index -= 1
+        elif before in ("OR", "AND"):
+            del tokens[index - 1:index + 1]
+            index -= 1
+        elif after in ("OR", "AND"):
+            del tokens[index:index + 2]
+        else:
+            del tokens[index]
+    return tokens
+
+
+def _render_kql(tokens: list) -> str:
+    """Join tokens into a query, leaving no dangling connector at either end."""
+    tokens = _without_dropped_terms(tokens)
+    while tokens and tokens[-1] in _CONNECTORS:
+        tokens.pop()
+    while tokens and tokens[0] in ("OR", "AND"):
+        tokens.pop(0)
+    text = ""
+    for token in tokens:
+        if text and token != ")" and not text.endswith("("):
+            text += " "
+        text += token
+    return text
 
 
 def gmail_query_to_kql(query: str) -> tuple[str, list[str]]:
@@ -249,19 +274,21 @@ def gmail_query_to_kql(query: str) -> tuple[str, list[str]]:
     term no message can match, so an untranslated query silently finds nothing.
     Terms with no Graph equivalent are returned so callers can report them.
     """
-    tokens: list[str] = []
+    tokens: list = []
     ignored: list[str] = []
     for match in _SEARCH_TERM.finditer(query):
-        if match["bracket"]:
-            tokens.append(match["bracket"])
+        if match["closing"]:
+            tokens.append(")")
             continue
         negated = bool(match["negated"])
+        if match["opening"]:
+            tokens.extend(["NOT", "("] if negated else ["("])
+            continue
         if match["field"]:
             term = _kql_for_field(match["field"], match["value"])
             if term is None:
                 ignored.append(match[0])
-                if tokens and tokens[-1] == "NOT":
-                    tokens.pop()
+                tokens.append(_DROPPED)
                 continue
         else:
             term = match["phrase"] or match["word"]
