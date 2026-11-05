@@ -11,6 +11,10 @@ holding whatever that provider needs to mint live credentials:
 Encrypting the whole blob (not just the refresh token) keeps the schema tiny and
 means no secret material ever sits in the clear. A one-time migration upgrades
 the old Google-only schema in place, preserving connected accounts.
+
+The key that encrypts those blobs lives in the macOS Keychain when one is
+available (see keystore.py), otherwise in `fernet.key`. The credentials folder
+stays private to the current user either way.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 from functools import wraps
@@ -25,14 +30,83 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from . import keystore
+
 CRED_DIR = Path(__file__).resolve().parent.parent / "credentials"
 DB_PATH = CRED_DIR / "accounts.db"
 KEY_PATH = CRED_DIR / "fernet.key"
+_DEFAULT_KEY_PATH = KEY_PATH
+
+
+class MissingKeyError(RuntimeError):
+    """Accounts are stored, but the key that decrypts them cannot be found."""
+
+
+def _restrict(path: Path, allowed: int) -> None:
+    """Remove any permission outside `allowed`. Never widens access."""
+    try:
+        current = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        return
+    if current & ~allowed:
+        path.chmod(current & allowed)
+
+
+def harden_credentials() -> None:
+    """Keep credentials and the local backups readable by this user only."""
+    CRED_DIR.mkdir(mode=0o700, exist_ok=True)
+    for folder in (CRED_DIR, CRED_DIR.parent / "backups"):
+        if not folder.is_dir():
+            continue
+        _restrict(folder, 0o700)
+        for path in folder.iterdir():
+            if path.is_file():
+                _restrict(path, 0o600)
+
+
+def _keychain_enabled() -> bool:
+    # A store at any other location keeps its own key file, so a temporary or
+    # alternate store can never read or replace the real Keychain item.
+    return KEY_PATH == _DEFAULT_KEY_PATH and keystore.available()
+
+
+def _has_stored_accounts() -> bool:
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return False
+    db = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True)
+    try:
+        return db.execute("SELECT EXISTS(SELECT 1 FROM accounts)").fetchone()[0] == 1
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        db.close()
 
 
 def _load_fernet() -> Fernet:
     """Load (or first-time generate) the symmetric key that encrypts auth_data."""
-    CRED_DIR.mkdir(exist_ok=True)
+    harden_credentials()
+    use_keychain = _keychain_enabled()
+    if use_keychain:
+        try:
+            stored = keystore.read()
+        except keystore.KeychainError:
+            if not KEY_PATH.exists():
+                raise
+            stored = None
+        if stored is not None:
+            return Fernet(stored)
+    if KEY_PATH.exists():
+        return Fernet(KEY_PATH.read_bytes())
+    if _has_stored_accounts():
+        # A new key could never decrypt these rows, and writing one would hide
+        # the real problem behind later decryption failures.
+        raise MissingKeyError(
+            "Connected accounts exist but their encryption key is missing. Restore "
+            "fernet.key or the Keychain item, or remove accounts.db and reconnect."
+        )
+    if use_keychain:
+        keystore.add(Fernet.generate_key())
+        return Fernet(keystore.read())
     if not KEY_PATH.exists():
         # Publish only a fully written key, and never replace another process's
         # key. Creating KEY_PATH directly exposes a partially written file.
@@ -80,8 +154,9 @@ class AccountStore:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        CRED_DIR.mkdir(exist_ok=True)
         self._fernet = _load_fernet()
+        # SQLite creates databases from the umask; journals copy this file's mode.
+        os.close(os.open(DB_PATH, os.O_CREAT | os.O_RDWR, 0o600))
         self._db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute(
