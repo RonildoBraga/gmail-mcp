@@ -1,3 +1,4 @@
+import contextlib
 import io
 import stat
 import subprocess
@@ -114,8 +115,15 @@ class ExtractTextTests(unittest.TestCase):
         done = subprocess.CompletedProcess([], 0, b'{"text": "ok"}', b"")
         with patch.object(documents.subprocess, "run", return_value=done) as run:
             documents.extract_text(b"%PDF", "a.pdf", "application/pdf")
-        self.assertEqual(run.call_args.args[0][1:], ["-I", "-m", "gmail_mcp.documents"])
+        self.assertEqual(run.call_args.args[0][1:3], ["-I", "-c"])
         self.assertIn("timeout", run.call_args.kwargs)
+
+    def test_files_planted_in_the_working_directory_are_not_imported(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "pypdf.py").write_text("raise SystemExit(9)\n")
+            with contextlib.chdir(folder):
+                result = documents.extract_text(pdf_with("Hello"), "a.pdf", "application/pdf")
+        self.assertEqual(result["text"], "Hello")
 
 
 class DecorativeImageTests(unittest.TestCase):

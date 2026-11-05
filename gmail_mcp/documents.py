@@ -32,6 +32,11 @@ _TEXT_SUFFIXES = {".csv", ".eml", ".ics", ".json", ".log", ".md", ".txt", ".tsv"
 _TEXT_TYPES = {"application/json", "application/xml"}
 _DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+# -I keeps the working directory off the child's import path, so a file planted
+# next to wherever the server was started can't run. The package's own location
+# is added back explicitly, which also works when it isn't installed.
+_WORKER = "import sys; sys.path.insert(0, sys.argv[1]); from gmail_mcp.documents import _worker; _worker()"
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def is_decorative(mime: str, size: int, inline: bool) -> bool:
@@ -149,7 +154,7 @@ def extract_text(data: bytes, filename: str, mime: str) -> dict:
     request = json.dumps({"kind": kind}).encode() + b"\n" + data
     try:
         result = subprocess.run(
-            [sys.executable, "-I", "-m", "gmail_mcp.documents"], input=request,
+            [sys.executable, "-I", "-c", _WORKER, _PACKAGE_ROOT], input=request,
             capture_output=True, timeout=_WORKER_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -186,7 +191,3 @@ def save(data: bytes, filename: str) -> Path:
 def _worker() -> None:
     header, _, data = sys.stdin.buffer.read().partition(b"\n")
     json.dump(_READERS[json.loads(header)["kind"]](data), sys.stdout)
-
-
-if __name__ == "__main__":
-    _worker()
