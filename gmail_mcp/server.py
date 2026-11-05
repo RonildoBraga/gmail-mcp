@@ -184,7 +184,8 @@ def create_label(name: str, account: str | None = None) -> dict:
 
 @mcp.tool(annotations=MUTATING)
 def label_thread(thread_id: str, label_ids: list[str], account: str | None = None) -> dict:
-    """Add one or more labels to a thread (Gmail only)."""
+    """Add one or more labels to a thread (Gmail only). Gmail's TRASH and SPAM
+    labels are refused because Gmail deletes that mail after 30 days."""
     return provider_for(account).modify_labels(thread_id, add=label_ids, remove=[])
 
 
@@ -209,7 +210,8 @@ def move_thread(thread_id: str, folder: str, account: str | None = None) -> dict
     Outlook: a well-known folder (Archive, Junk Email, Deleted Items) or a custom
     folder, created on demand -- prefer a custom folder (e.g. "Junk", "Finance")
     over the built-in "Junk Email"/"Deleted Items", which auto-purge. Gmail: a
-    label of that name (created if missing), and INBOX is removed."""
+    label of that name (created if missing), and INBOX is removed; Trash and Spam
+    are refused because Gmail deletes that mail after 30 days."""
     return provider_for(account).move_thread(thread_id, folder)
 
 

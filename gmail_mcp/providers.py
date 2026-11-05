@@ -12,6 +12,17 @@ from googleapiclient.discovery import build
 from . import auth, documents, gmail, graph, mailtext
 
 _MS_NO_LABELS = "Labels aren't supported for Microsoft (Outlook) accounts yet."
+_AUTO_DELETING_LABELS = frozenset({"TRASH", "SPAM"})
+
+
+def _refuse_auto_deleting_labels(labels: list[str]) -> None:
+    """Stop a label change from putting mail where Gmail deletes it after 30 days."""
+    blocked = sorted({label.strip().upper() for label in labels} & _AUTO_DELETING_LABELS)
+    if blocked:
+        raise ValueError(
+            f"Refusing to apply {', '.join(blocked)}: Gmail deletes that mail after 30 days. "
+            "Use a custom label or archive the thread instead."
+        )
 
 
 def _gmail_items(resource, key: str, max_results: int, page_token: str | None = None,
@@ -86,6 +97,7 @@ class GmailProvider:
         return {"account": self.email, "id": label["id"], "name": label["name"]}
 
     def modify_labels(self, thread_id: str, add: list[str], remove: list[str]) -> dict:
+        _refuse_auto_deleting_labels(add)
         self.svc.users().threads().modify(
             userId="me", id=thread_id, body={"addLabelIds": add, "removeLabelIds": remove}
         ).execute()
