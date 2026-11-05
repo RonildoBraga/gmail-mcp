@@ -9,7 +9,7 @@ import io
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-from . import auth
+from . import auth, documents, mailtext
 
 FIELDS = "id, name, mimeType, size, modifiedTime, parents, webViewLink, trashed"
 
@@ -56,19 +56,29 @@ def list_files(svc, max_results: int, page_token: str | None = None, **params) -
     return {"files": files, "next_page_token": token}
 
 
-def read_content(svc, file_id: str, max_chars: int = 200_000) -> tuple[dict, str | None]:
-    """Return (metadata, text). text is None for binary files (images, PDFs, etc.)."""
+def _download(svc, file_id: str) -> bytes:
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id, supportsAllDrives=True))
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue()
+
+
+def read_content(svc, file_id: str, max_chars: int = 200_000) -> dict:
+    """Return the file's metadata, its text when readable, and any note about it."""
     meta = file_meta(svc, file_id)
     mime = meta.get("mimeType", "")
     if mime in _EXPORT:
         data = svc.files().export(fileId=file_id, mimeType=_EXPORT[mime]).execute()
-        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
-        return meta, text[:max_chars]
-    if mime.startswith("text/") or mime in ("application/json", "application/xml"):
-        buf = io.BytesIO()
-        dl = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id, supportsAllDrives=True))
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        return meta, buf.getvalue().decode("utf-8", "replace")[:max_chars]
-    return meta, None
+        extracted = {"text": data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)}
+    elif mime.startswith("application/vnd.google-apps."):
+        extracted = {"text": None, "note": "This Google file type can't be exported as text."}
+    else:
+        documents.check_size(int(meta.get("size") or 0))
+        extracted = documents.extract_text(_download(svc, file_id), meta.get("name", ""), mime)
+    text = extracted.get("text")
+    if text is None:
+        return {"meta": meta, **extracted}
+    text, truncated = mailtext.limit(text, max_chars)
+    return {"meta": meta, **extracted, "text": text, "truncated": truncated}

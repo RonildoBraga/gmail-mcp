@@ -104,6 +104,7 @@ stdio server:
 | `list_accounts` / `set_default_account` / `remove_account` | ✅ | ✅ |
 | `get_account_capabilities` (no token refresh) | ✅ | ✅ |
 | `search_threads` / `get_thread` | ✅ | ✅ |
+| `read_attachment` / `save_attachment` | ✅ | ✅ |
 | `search_all_threads` (cross-account, cross-provider) | ✅ | ✅ |
 | `create_draft` / `list_drafts` / `send_message` | ✅ | ✅ |
 | `archive_thread` / `move_thread` / `list_folders` | ✅ | ✅ |
@@ -117,6 +118,18 @@ labels (remove `INBOX`; a folder name maps to a label), Outlook moves the
 conversation between mail folders (well-known `Archive` / `Junk Email` /
 `Deleted Items`, or a custom folder created on demand). Prefer a custom folder
 over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
+
+`get_thread` returns readable text by default, so a marketing email costs a
+fraction of its raw size. Hidden content and invisible characters are removed, and
+long tracking links are reduced to their domain. Pass `body_format="html"` for the
+original markup and exact links. `max_chars` limits each body, and a cut body sets
+`body_truncated`. Search snippets are cleaned the same way.
+
+Each message lists its `attachments`, leaving out small embedded logos. Pass its
+`message_id` and an `attachment_id` to `read_attachment` for the text of a PDF, Word,
+Excel, HTML or plain text file, or to `save_attachment` to write it to
+`~/Downloads/gmail-mcp`. `drive_read` reads the same file types from Drive. Scanned
+PDFs have no text to read, and a `note` says so. Files are limited to 25 MB.
 
 Search syntax: use Gmail query syntax for every account (`is:unread from:a@b.com`).
 Microsoft accounts translate it for Graph `$search`: `after:`, `before:`,
@@ -208,6 +221,10 @@ entrypoint without starting authentication or the stdio server.
 - Without the key the stored credentials are unrecoverable, so you'd reconnect the
   accounts. A missing key stops with an error instead of creating a new one that
   couldn't decrypt them.
+- Attachments and Drive files are parsed in a short-lived child process with a
+  timeout, so a hostile file can't hang the server or reach decrypted tokens.
+  Saved files are private to the current user, stay inside the save folder whatever
+  name the sender chose, and never replace an existing file.
 - Existing email/default selectors remain unchanged. Provider collisions are
   rejected in either direction, including case variants. Use a distinct Microsoft
   alias when its primary address is already stored as Google.

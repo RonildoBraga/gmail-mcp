@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from googleapiclient.discovery import build
 
-from . import auth, gmail, graph
+from . import auth, documents, gmail, graph, mailtext
 
 _MS_NO_LABELS = "Labels aren't supported for Microsoft (Outlook) accounts yet."
 
@@ -56,9 +56,25 @@ class GmailProvider:
         return {"account": self.email, "query": query, "threads": threads,
                 "next_page_token": next_token}
 
-    def get_thread(self, thread_id: str) -> dict:
+    def get_thread(self, thread_id: str, body_format: str = "text",
+                   max_chars: int = mailtext.DEFAULT_MAX_CHARS) -> dict:
         t = self.svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
-        return {"account": self.email, "thread": gmail.render_thread(t)}
+        return {"account": self.email,
+                "thread": gmail.render_thread(t, body_format=body_format, max_chars=max_chars)}
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> dict:
+        messages = self.svc.users().messages()
+        message = messages.get(userId="me", id=message_id, format="full").execute()
+        part = gmail.find_attachment(message["payload"], attachment_id)
+        documents.check_size(part["body"].get("size", 0))
+        encoded = part["body"].get("data")
+        if not encoded:
+            encoded = messages.attachments().get(
+                userId="me", messageId=message_id, id=part["body"]["attachmentId"]
+            ).execute()["data"]
+        return {"filename": part["filename"],
+                "mime_type": part.get("mimeType", "application/octet-stream"),
+                "data": gmail.decode_data(encoded)}
 
     def list_labels(self) -> dict:
         labels = self.svc.users().labels().list(userId="me").execute().get("labels", [])
@@ -126,8 +142,14 @@ class GraphProvider:
                 **graph.search_threads(self.token, query, max_results, page_token,
                                        account=self.email)}
 
-    def get_thread(self, thread_id: str) -> dict:
-        return {"account": self.email, "thread": graph.get_thread(self.token, thread_id)}
+    def get_thread(self, thread_id: str, body_format: str = "text",
+                   max_chars: int = mailtext.DEFAULT_MAX_CHARS) -> dict:
+        return {"account": self.email,
+                "thread": graph.get_thread(self.token, thread_id, body_format=body_format,
+                                           max_chars=max_chars)}
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> dict:
+        return graph.get_attachment(self.token, message_id, attachment_id)
 
     def create_draft(self, to, subject, body, cc, bcc) -> dict:
         return {"account": self.email, **graph.create_draft(self.token, to, subject, body, cc, bcc)}

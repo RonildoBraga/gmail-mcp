@@ -34,6 +34,7 @@ pydantic-settings==2.14.1
 pydantic_core==2.46.4
 PyJWT==2.13.0
 pyparsing==3.3.2
+pypdf==6.14.2
 python-dotenv==1.2.2
 python-multipart==0.0.30
 pywin32==311; sys_platform == "win32"

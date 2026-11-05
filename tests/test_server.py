@@ -61,5 +61,66 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(tools["create_filter"].inputSchema["properties"]["dry_run"]["default"])
 
 
+class AttachmentToolTests(unittest.TestCase):
+    def provider(self):
+        provider = Mock(email="a@example.com")
+        provider.get_attachment.return_value = {
+            "filename": "bill.pdf", "mime_type": "application/pdf", "data": b"pdf-bytes"}
+        return provider
+
+    def test_read_returns_text_with_its_source(self):
+        provider = self.provider()
+        with patch.object(server, "provider_for", return_value=provider), \
+             patch.object(server.documents, "extract_text", return_value={"text": "Total 5", "pages": 1}):
+            result = server.read_attachment("m1", "2", "a@example.com")
+        self.assertEqual(result, {"account": "a@example.com", "filename": "bill.pdf",
+                                  "mime_type": "application/pdf", "size": 9, "text": "Total 5",
+                                  "pages": 1, "truncated": False})
+
+    def test_read_limits_long_text(self):
+        provider = self.provider()
+        with patch.object(server, "provider_for", return_value=provider), \
+             patch.object(server.documents, "extract_text", return_value={"text": "abcdef"}):
+            result = server.read_attachment("m1", "2", max_chars=3)
+        self.assertEqual((result["text"], result["truncated"]), ("abc", True))
+
+    def test_read_passes_on_a_note_when_there_is_no_text(self):
+        provider = self.provider()
+        with patch.object(server, "provider_for", return_value=provider), \
+             patch.object(server.documents, "extract_text", return_value={"text": None, "note": "no"}):
+            result = server.read_attachment("m1", "2")
+        self.assertIsNone(result["text"])
+        self.assertEqual(result["note"], "no")
+
+    def test_save_reports_where_the_file_went(self):
+        provider = self.provider()
+        with patch.object(server, "provider_for", return_value=provider), \
+             patch.object(server.documents, "save", return_value="/tmp/bill.pdf") as save:
+            result = server.save_attachment("m1", "2")
+        save.assert_called_once_with(b"pdf-bytes", "bill.pdf")
+        self.assertEqual(result, {"account": "a@example.com", "path": "/tmp/bill.pdf", "size": 9})
+
+    def test_get_thread_forwards_reading_options(self):
+        provider = self.provider()
+        with patch.object(server, "provider_for", return_value=provider):
+            server.get_thread("t1", "a@example.com", "html", 50)
+        provider.get_thread.assert_called_once_with("t1", "html", 50)
+
+    def test_drive_read_reports_notes_and_pages(self):
+        read = {"meta": {"id": "1", "name": "a.pdf", "mimeType": "application/pdf"}, "text": "x",
+                "pages": 2, "truncated": False}
+        with patch.object(server.drive, "service_for", return_value=("a@example.com", Mock())), \
+             patch.object(server.drive, "read_content", return_value=read):
+            result = server.drive_read("1")
+        self.assertEqual((result["content"], result["binary"], result["pages"]), ("x", False, 2))
+
+    def test_drive_read_marks_unreadable_files_as_binary(self):
+        read = {"meta": {"id": "1", "name": "a.png", "mimeType": "image/png"}, "text": None, "note": "no"}
+        with patch.object(server.drive, "service_for", return_value=("a@example.com", Mock())), \
+             patch.object(server.drive, "read_content", return_value=read):
+            result = server.drive_read("1")
+        self.assertEqual((result["content"], result["binary"], result["note"]), (None, True, "no"))
+
+
 if __name__ == "__main__":
     unittest.main()
