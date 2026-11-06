@@ -217,11 +217,17 @@ class InboxScopeTests(unittest.TestCase):
             result = graph.search_threads("token", query, 5)
         return request.call_args.args[2], result
 
+    def search_term(self, query):
+        path, result = self.path(query)
+        return graph.urllib.parse.unquote(path.split("$search=")[1].split("&")[0]), result
+
     def test_inbox_alone_lists_the_inbox_newest_first(self):
-        path, result = self.path("in:inbox")
-        self.assertTrue(path.startswith("/me/mailFolders/inbox/messages?"))
-        self.assertIn("$orderby=receivedDateTime", path)
-        self.assertNotIn("ignored_terms", result)
+        for query in ("in:inbox", "in:inbox AND", "AND in:inbox"):
+            with self.subTest(query=query):
+                path, result = self.path(query)
+                self.assertTrue(path.startswith("/me/mailFolders/inbox/messages?"))
+                self.assertIn("$orderby=receivedDateTime", path)
+                self.assertNotIn("ignored_terms", result)
 
     def test_inbox_scopes_the_rest_of_a_search(self):
         for query in ("in:inbox is:unread", "IN:INBOX is:unread", "is:unread in:inbox",
@@ -233,18 +239,39 @@ class InboxScopeTests(unittest.TestCase):
                 self.assertNotIn("in%3Ainbox", path)
                 self.assertNotIn("ignored_terms", result)
 
+    def test_removing_inbox_takes_its_connector_with_it(self):
+        cases = {
+            "from:a@example.com AND in:inbox AND is:unread": "from:a@example.com AND isread:false",
+            "in:inbox AND from:a@example.com AND is:unread": "from:a@example.com AND isread:false",
+            "from:a@example.com AND is:unread AND in:inbox": "from:a@example.com AND isread:false",
+            "a AND in:inbox AND in:inbox AND b": "a AND b",
+            "in:inbox AND in:inbox invoice": "invoice",
+            "in:inbox AND NOT invoice": "NOT invoice",
+        }
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                term, result = self.search_term(query)
+                self.assertEqual(term, f'"{expected}"')
+                self.assertNotIn("ignored_terms", result)
+
     def test_searches_without_it_cover_the_whole_mailbox(self):
         self.assertTrue(self.path("is:unread")[0].startswith("/me/messages?"))
         self.assertTrue(self.path("")[0].startswith("/me/messages?"))
 
     def test_inbox_that_cannot_become_a_path_is_reported_not_applied(self):
-        for query in ("-in:inbox invoice", "in:inbox OR invoice", "invoice OR in:inbox",
-                      "(in:inbox invoice)", "in:sent invoice"):
+        for query in ("-in:inbox invoice", "NOT in:inbox invoice", "invoice AND NOT in:inbox",
+                      "in:inbox OR invoice", "invoice OR in:inbox", "(in:inbox invoice)",
+                      "in:sent invoice"):
             with self.subTest(query=query):
                 self.assertEqual(graph._inbox_scope(query), (query, False))
                 path, result = self.path(query)
                 self.assertTrue(path.startswith("/me/messages?"))
                 self.assertTrue(result["ignored_terms"])
+
+    def test_a_negated_inbox_leaves_the_next_term_alone(self):
+        term, result = self.search_term("NOT in:inbox invoice")
+        self.assertEqual(term, '"invoice"')
+        self.assertEqual(result["ignored_terms"], ["in:inbox"])
 
     def test_a_cursor_from_the_inbox_cannot_continue_a_whole_mailbox_search(self):
         pages = [{"value": [{"id": "1"}, {"id": "2"}]}]

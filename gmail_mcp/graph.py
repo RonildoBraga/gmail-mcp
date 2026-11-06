@@ -313,22 +313,30 @@ def gmail_query_to_kql(query: str) -> tuple[str, list[str]]:
 def _inbox_scope(query: str) -> tuple[str, bool]:
     """Take a top-level `in:inbox` out of a query, because Graph scopes it by path.
 
+    An AND that joined it goes too, because `a AND AND b` is not a valid search.
     Inside brackets, negated or joined by OR it can't become a path, so it stays in
     the query and is reported in `ignored_terms` like other Gmail-only operators.
     """
     matches = list(_SEARCH_TERM.finditer(query))
-    spans, depth = [], 0
+    removed, depth = set(), 0
     for index, match in enumerate(matches):
         depth += 1 if match["opening"] else -1 if match["closing"] else 0
         if (depth or match["negated"] or (match["field"] or "").lower() != "in"
                 or match["value"].lower() != "inbox"):
             continue
-        neighbours = matches[max(index - 1, 0):index] + matches[index + 1:index + 2]
-        if not any(neighbour[0] == "OR" for neighbour in neighbours):
-            spans.append(match.span())
-    for start, end in reversed(spans):
+        before = matches[index - 1][0] if index else None
+        after = matches[index + 1][0] if index + 1 < len(matches) else None
+        if before in ("NOT", "OR") or after == "OR":
+            continue
+        removed.add(index)
+        if before == "AND":
+            removed.add(index - 1)
+        elif after == "AND":
+            removed.add(index + 1)
+    for index in sorted(removed, reverse=True):
+        start, end = matches[index].span()
         query = query[:start] + query[end:]
-    return query, bool(spans)
+    return query, bool(removed)
 
 
 def search_threads(token: str, query: str, top: int, page_token: str | None = None,
