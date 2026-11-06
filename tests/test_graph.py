@@ -211,6 +211,143 @@ class SearchTranslationTests(unittest.TestCase):
         self.assertNotIn("ignored_terms", result)
 
 
+class InboxScopeTests(unittest.TestCase):
+    def path(self, query):
+        with patch.object(graph, "_request", return_value={"value": []}) as request:
+            result = graph.search_threads("token", query, 5)
+        return request.call_args.args[2], result
+
+    def search_term(self, query):
+        path, result = self.path(query)
+        return graph.urllib.parse.unquote(path.split("$search=")[1].split("&")[0]), result
+
+    def test_inbox_alone_lists_the_inbox_newest_first(self):
+        for query in ("in:inbox", "in:inbox AND", "AND in:inbox"):
+            with self.subTest(query=query):
+                path, result = self.path(query)
+                self.assertTrue(path.startswith("/me/mailFolders/inbox/messages?"))
+                self.assertIn("$orderby=receivedDateTime", path)
+                self.assertNotIn("ignored_terms", result)
+
+    def test_inbox_scopes_the_rest_of_a_search(self):
+        for query in ("in:inbox is:unread", "IN:INBOX is:unread", "is:unread in:inbox",
+                      "in:inbox AND is:unread"):
+            with self.subTest(query=query):
+                path, result = self.path(query)
+                self.assertTrue(path.startswith("/me/mailFolders/inbox/messages?$search="))
+                self.assertIn("isread", path.lower())
+                self.assertNotIn("in%3Ainbox", path)
+                self.assertNotIn("ignored_terms", result)
+
+    def test_removing_inbox_takes_its_connector_with_it(self):
+        cases = {
+            "from:a@example.com AND in:inbox AND is:unread": "from:a@example.com AND isread:false",
+            "in:inbox AND from:a@example.com AND is:unread": "from:a@example.com AND isread:false",
+            "from:a@example.com AND is:unread AND in:inbox": "from:a@example.com AND isread:false",
+            "a AND in:inbox AND in:inbox AND b": "a AND b",
+            "in:inbox AND in:inbox invoice": "invoice",
+            "in:inbox AND NOT invoice": "NOT invoice",
+        }
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                term, result = self.search_term(query)
+                self.assertEqual(term, f'"{expected}"')
+                self.assertNotIn("ignored_terms", result)
+
+    def test_searches_without_it_cover_the_whole_mailbox(self):
+        self.assertTrue(self.path("is:unread")[0].startswith("/me/messages?"))
+        self.assertTrue(self.path("")[0].startswith("/me/messages?"))
+
+    def test_inbox_that_cannot_become_a_path_is_reported_not_applied(self):
+        for query in ("-in:inbox invoice", "NOT in:inbox invoice", "invoice AND NOT in:inbox",
+                      "in:inbox OR invoice", "invoice OR in:inbox", "(in:inbox invoice)",
+                      "in:sent invoice"):
+            with self.subTest(query=query):
+                self.assertEqual(graph._inbox_scope(query), (query, False))
+                path, result = self.path(query)
+                self.assertTrue(path.startswith("/me/messages?"))
+                self.assertTrue(result["ignored_terms"])
+
+    def test_a_negated_inbox_leaves_the_next_term_alone(self):
+        term, result = self.search_term("NOT in:inbox invoice")
+        self.assertEqual(term, '"invoice"')
+        self.assertEqual(result["ignored_terms"], ["in:inbox"])
+
+    def test_a_cursor_from_the_inbox_cannot_continue_a_whole_mailbox_search(self):
+        pages = [{"value": [{"id": "1"}, {"id": "2"}]}]
+        with patch.object(graph, "_request", side_effect=pages):
+            token = graph.search_threads("token", "in:inbox", 1)["next_page_token"]
+        with self.assertRaisesRegex(ValueError, "continuation token"):
+            graph.search_threads("token", "", 1, token)
+
+
+class FolderPathTests(unittest.TestCase):
+    def test_a_path_walks_child_folders_without_creating_anything(self):
+        pages = [{"value": [{"id": "parent/id"}]}, {"value": [{"id": "child"}]}]
+        with patch.object(graph, "_request", side_effect=pages) as request:
+            self.assertEqual(graph.resolve_folder("token", "Finance/Receipts", create=True), "child")
+        first, second = [call.args for call in request.call_args_list]
+        self.assertEqual(first[1], "GET")
+        self.assertTrue(first[2].startswith("/me/mailFolders?$filter="))
+        self.assertIn("Finance", first[2])
+        self.assertEqual(second[1], "GET")
+        self.assertTrue(second[2].startswith("/me/mailFolders/parent%2Fid/childFolders?$filter="))
+        self.assertIn("Receipts", second[2])
+
+    def test_a_missing_child_is_created_under_its_parent_not_at_the_top(self):
+        pages = [{"value": [{"id": "parent"}]}, {"value": []}, {"id": "new"}]
+        with patch.object(graph, "_request", side_effect=pages) as request:
+            self.assertEqual(graph.resolve_folder("token", "Finance/New", create=True), "new")
+        self.assertEqual(request.call_args.args[1:4],
+                         ("POST", "/me/mailFolders/parent/childFolders", {"displayName": "New"}))
+
+    def test_a_missing_child_is_an_error_unless_creating(self):
+        pages = [{"value": [{"id": "parent"}]}, {"value": []}]
+        with patch.object(graph, "_request", side_effect=pages) as request, \
+                self.assertRaisesRegex(RuntimeError, "not found"):
+            graph.resolve_folder("token", "Finance/New")
+        self.assertEqual(request.call_count, 2)
+
+    def test_malformed_paths_are_rejected_before_any_request(self):
+        with patch.object(graph, "_request") as request:
+            for name in ("", "/Finance", "Finance/", "Finance//Receipts", "Finance/ "):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "folder path"):
+                    graph.resolve_folder("token", name)
+        request.assert_not_called()
+
+    def test_well_known_names_need_no_lookup(self):
+        with patch.object(graph, "_request") as request:
+            self.assertEqual(graph.resolve_folder("token", "Archive"), "archive")
+        request.assert_not_called()
+
+    def test_child_folders_are_listed_by_path(self):
+        pages = [
+            {"value": [{"id": "a=", "displayName": "Finance", "totalItemCount": 0, "childFolderCount": 1},
+                       {"id": "b", "displayName": "Inbox", "totalItemCount": 3}]},
+            {"value": [{"id": "c", "displayName": "Receipts", "totalItemCount": 9, "childFolderCount": 1}]},
+            {"value": [{"id": "d", "displayName": "2026", "totalItemCount": 1}]},
+        ]
+        with patch.object(graph, "_request", side_effect=pages) as request:
+            folders = graph.list_folders("token")
+        self.assertEqual([(f["name"], f["count"]) for f in folders],
+                         [("Finance", 0), ("Finance/Receipts", 9), ("Finance/Receipts/2026", 1), ("Inbox", 3)])
+        self.assertIn("/me/mailFolders/a%3D/childFolders", request.call_args_list[1].args[2])
+
+    def test_folders_that_delete_mail_are_refused_before_any_request(self):
+        with patch.object(graph, "_request") as request:
+            for folder in ("Deleted Items", "deleteditems", "Junk Email", "junkemail", " junk email "):
+                with self.subTest(folder=folder), self.assertRaisesRegex(ValueError, "Refusing"):
+                    graph.move_thread("token", "conversation", folder)
+        request.assert_not_called()
+
+    def test_the_custom_junk_folder_is_still_allowed(self):
+        pages = [{"value": [{"id": "m"}]}, {"value": [{"id": "junk-folder"}]}, {"id": "moved"}]
+        with patch.object(graph, "_request", side_effect=pages) as request:
+            result = graph.move_thread("token", "conversation", "Junk")
+        self.assertTrue(result["complete"])
+        self.assertEqual(request.call_args.args[3], {"destinationId": "junk-folder"})
+
+
 class GraphMessageTests(unittest.TestCase):
     def thread(self, message, attachments=(), **options):
         pages = [{"value": [message]}, {"value": list(attachments)}]

@@ -98,8 +98,10 @@ def remove_account(email: str) -> dict:
 @mcp.tool(annotations=READ_ONLY)
 def search_threads(query: str, account: str | None = None, max_results: int = 20,
                    page_token: str | None = None) -> dict:
-    """Search threads in one account. Gmail uses Gmail query syntax
-    ('is:unread from:a@b.com'); Microsoft treats the query as free-text search."""
+    """Search threads in one account with Gmail query syntax
+    ('is:unread from:a@b.com'). `in:inbox` limits it to the inbox on every account.
+    Microsoft accounts translate the query and list terms they can't use in
+    `ignored_terms`."""
     return provider_for(account).search_threads(query, max_results, page_token)
 
 
@@ -207,17 +209,17 @@ def archive_thread(thread_id: str, account: str | None = None) -> dict:
 @mcp.tool(annotations=MUTATING)
 def move_thread(thread_id: str, folder: str, account: str | None = None) -> dict:
     """File a thread into `folder`, out of the inbox. Works for both providers.
-    Outlook: a well-known folder (Archive, Junk Email, Deleted Items) or a custom
-    folder, created on demand -- prefer a custom folder (e.g. "Junk", "Finance")
-    over the built-in "Junk Email"/"Deleted Items", which auto-purge. Gmail: a
-    label of that name (created if missing), and INBOX is removed; Trash and Spam
-    are refused because Gmail deletes that mail after 30 days."""
+    Outlook: Archive or a custom folder, created on demand, with child folders named
+    by path (e.g. "Finance/Receipts"). Gmail: a label of that name (created if
+    missing), and INBOX is removed. Places that delete mail automatically are
+    refused: Outlook's Junk Email and Deleted Items, and Gmail's Trash and Spam."""
     return provider_for(account).move_thread(thread_id, folder)
 
 
 @mcp.tool(annotations=READ_ONLY)
 def list_folders(account: str | None = None) -> dict:
-    """List folders (Outlook) or labels (Gmail) in an account."""
+    """List folders (Outlook) or labels (Gmail) in an account. Outlook child folders
+    are named by path, such as Finance/Receipts."""
     return provider_for(account).list_folders()
 
 
