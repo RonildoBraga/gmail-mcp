@@ -310,19 +310,51 @@ def gmail_query_to_kql(query: str) -> tuple[str, list[str]]:
     return _render_kql(tokens), ignored
 
 
+def _inbox_scope(query: str) -> tuple[str, bool]:
+    """Take a top-level `in:inbox` out of a query, because Graph scopes it by path.
+
+    An AND that joined it goes too, because `a AND AND b` is not a valid search.
+    Inside brackets, negated or joined by OR it can't become a path, so it stays in
+    the query and is reported in `ignored_terms` like other Gmail-only operators.
+    """
+    matches = list(_SEARCH_TERM.finditer(query))
+    removed, depth = set(), 0
+    for index, match in enumerate(matches):
+        depth += 1 if match["opening"] else -1 if match["closing"] else 0
+        if (depth or match["negated"] or (match["field"] or "").lower() != "in"
+                or match["value"].lower() != "inbox"):
+            continue
+        before = matches[index - 1][0] if index else None
+        after = matches[index + 1][0] if index + 1 < len(matches) else None
+        if before in ("NOT", "OR") or after == "OR":
+            continue
+        removed.add(index)
+        if before == "AND":
+            removed.add(index - 1)
+        elif after == "AND":
+            removed.add(index + 1)
+    for index in sorted(removed, reverse=True):
+        start, end = matches[index].span()
+        query = query[:start] + query[end:]
+    return query, bool(removed)
+
+
 def search_threads(token: str, query: str, top: int, page_token: str | None = None,
                    *, account: str = "") -> dict:
-    """Search the mailbox. Uses Graph $search when a query is given, else recent mail."""
+    """Search the mailbox. Uses Graph $search when a query is given, else recent mail.
+    `in:inbox` limits either one to the inbox."""
     ignored: list[str] = []
-    if query and query.strip():
-        kql, ignored = gmail_query_to_kql(query)
+    terms, inbox_only = _inbox_scope(query or "")
+    base = "/me/mailFolders/inbox/messages" if inbox_only else "/me/messages"
+    if terms.strip():
+        kql, ignored = gmail_query_to_kql(terms)
         if not kql:
             return {"threads": [], "next_page_token": None, "ignored_terms": ignored}
         escaped = kql.replace("\\", "\\\\").replace('"', '\\"')
         q = urllib.parse.quote(f'"{escaped}"')
-        path = f"/me/messages?$search={q}&$top={min(_limit(top), 1000)}&$select={_MSG_FIELDS.removesuffix(',body')}"
+        path = f"{base}?$search={q}&$top={min(_limit(top), 1000)}&$select={_MSG_FIELDS.removesuffix(',body')}"
     else:
-        path = f"/me/messages?$top={min(_limit(top), 1000)}&$orderby=receivedDateTime desc&$select={_MSG_FIELDS.removesuffix(',body')}"
+        path = f"{base}?$top={min(_limit(top), 1000)}&$orderby=receivedDateTime desc&$select={_MSG_FIELDS.removesuffix(',body')}"
     items, next_token = _bounded_items(token, path, top, page_token, f"search:{account}:{query}")
     result = {"threads": [_summary(m) for m in items], "next_page_token": next_token}
     if ignored:
@@ -425,6 +457,8 @@ def list_drafts(token: str, top: int, page_token: str | None = None,
 _WELL_KNOWN_FOLDERS = {
     "archive", "inbox", "junkemail", "deleteditems", "drafts", "sentitems",
 }
+_AUTO_DELETING_FOLDERS = {"junkemail", "deleteditems"}
+_FOLDER_FIELDS = "$top=100&$select=id,displayName,totalItemCount,childFolderCount"
 
 
 def _conversation_message_ids(token: str, conversation_id: str) -> list[str]:
@@ -434,30 +468,51 @@ def _conversation_message_ids(token: str, conversation_id: str) -> list[str]:
     return list(dict.fromkeys(m["id"] for m in _all_items(token, path)))
 
 
+def _child_folder(token: str, parent_id: str | None, name: str, create: bool) -> str:
+    """Find, or optionally create, a folder directly under `parent_id`."""
+    base = "/me/mailFolders"
+    if parent_id:
+        base += f"/{urllib.parse.quote(parent_id, safe='')}/childFolders"
+    escaped_name = name.replace("'", "''")
+    q = urllib.parse.quote(f"displayName eq '{escaped_name}'", safe="")
+    found = _all_items(token, f"{base}?$filter={q}")
+    if found:
+        return found[0]["id"]
+    if create:
+        return _request(token, "POST", base, {"displayName": name})["id"]
+    raise RuntimeError(f"Outlook folder {name!r} not found (create=False)")
+
+
 def resolve_folder(token: str, name: str, create: bool = False) -> str:
     """Resolve a destination folder to a Graph destinationId.
 
     A well-known name (archive, junkemail, deleteditems, inbox, ...) is accepted
-    verbatim -- Graph treats those as valid destinationIds. Otherwise the mailbox
-    is searched for a top-level folder with that display name, optionally creating
-    it. Custom folders are used (not the built-in "Junk Email"/"Deleted Items")
-    when we want mail that won't be auto-purged.
+    verbatim -- Graph treats those as valid destinationIds. Otherwise each segment
+    of a path such as Finance/Receipts is looked up under the one before it,
+    optionally creating what's missing.
     """
     key = name.strip().lower().replace(" ", "")
     if key in _WELL_KNOWN_FOLDERS:
         return key
-    escaped_name = name.replace("'", "''")
-    q = urllib.parse.quote(f"displayName eq '{escaped_name}'", safe="")
-    found = _all_items(token, f"/me/mailFolders?$filter={q}")
-    if found:
-        return found[0]["id"]
-    if create:
-        return _request(token, "POST", "/me/mailFolders", {"displayName": name})["id"]
-    raise RuntimeError(f"Outlook folder {name!r} not found (create=False)")
+    parts = [part.strip() for part in name.split("/")]
+    if not all(parts):
+        raise ValueError(f"Invalid folder path {name!r}")
+    folder_id = None
+    for part in parts:
+        folder_id = _child_folder(token, folder_id, part, create)
+    return folder_id
 
 
 def move_thread(token: str, conversation_id: str, folder: str, create: bool = True) -> dict:
-    """Move every message in a conversation to `folder` (well-known or custom)."""
+    """Move every message in a conversation to `folder` (well-known or custom).
+
+    Outlook purges Junk Email and Deleted Items by itself, so nothing is filed there.
+    """
+    if folder.strip().lower().replace(" ", "") in _AUTO_DELETING_FOLDERS:
+        raise ValueError(
+            f"Refusing to move mail to {folder}: Outlook deletes it from there automatically. "
+            "Use a custom folder or archive the thread instead."
+        )
     ids = _conversation_message_ids(token, conversation_id)
     if not ids:
         return {"thread_id": conversation_id, "moved": 0, "destination": folder}
@@ -481,10 +536,18 @@ def move_thread(token: str, conversation_id: str, folder: str, create: bool = Tr
             "destination_id": dest, "moved_messages": moved, "complete": True}
 
 
+def _folders_under(token: str, path: str, prefix: str = "") -> list[dict]:
+    rows = []
+    for folder in _all_items(token, path):
+        name = f"{prefix}{folder.get('displayName')}"
+        rows.append({"id": folder["id"], "name": name, "count": folder.get("totalItemCount")})
+        if folder.get("childFolderCount"):
+            quoted = urllib.parse.quote(folder["id"], safe="")
+            rows += _folders_under(token, f"/me/mailFolders/{quoted}/childFolders?{_FOLDER_FIELDS}",
+                                   f"{name}/")
+    return rows
+
+
 def list_folders(token: str) -> list[dict]:
-    """Top-level mail folders with their item counts."""
-    path = "/me/mailFolders?$top=100&$select=id,displayName,totalItemCount"
-    return [
-        {"id": f["id"], "name": f.get("displayName"), "count": f.get("totalItemCount")}
-        for f in _all_items(token, path)
-    ]
+    """Mail folders with their item counts. Child folders are named by path."""
+    return _folders_under(token, f"/me/mailFolders?{_FOLDER_FIELDS}")

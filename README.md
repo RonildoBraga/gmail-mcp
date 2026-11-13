@@ -115,12 +115,14 @@ stdio server:
 
 `archive_thread` / `move_thread` unify filing across providers: Gmail moves
 labels (remove `INBOX`; a folder name maps to a label), Outlook moves the
-conversation between mail folders (well-known `Archive` / `Junk Email` /
-`Deleted Items`, or a custom folder created on demand). Prefer a custom folder
-over Outlook's built-in `Junk Email` / `Deleted Items`, which auto-purge.
-`label_thread` and `move_thread` refuse Gmail's `TRASH` and `SPAM` labels, because
-Gmail deletes that mail after 30 days. Use a custom label or archive the thread
-instead.
+conversation between mail folders (`Archive`, or a custom folder created on demand).
+Name an Outlook child folder by its path, such as `Finance/Receipts`; `list_folders`
+shows them the same way.
+
+Mail can't be filed anywhere that deletes it automatically. `label_thread` and
+`move_thread` refuse Gmail's `TRASH` and `SPAM` labels, and `move_thread` refuses
+Outlook's `Junk Email` and `Deleted Items`. Use a custom folder or label, or archive
+the thread instead.
 
 `get_thread` returns readable text by default, so a marketing email costs a
 fraction of its raw size. Hidden content and invisible characters are removed, and
@@ -137,7 +139,8 @@ PDFs have no text to read, and a `note` says so. Files are limited to 25 MB.
 Search syntax: use Gmail query syntax for every account (`is:unread from:a@b.com`).
 Microsoft accounts translate it for Graph `$search`: `after:`, `before:`,
 `newer_than:`, `older_than:`, `has:attachment`, `is:read`, `is:unread` and `-term`
-all work, and quoted phrases are safe. Operators with no Graph equivalent, such as
+all work, and quoted phrases are safe. `in:inbox` limits a search to the inbox, and
+on its own lists the inbox newest first. Operators with no Graph equivalent, such as
 `label:` and `category:`, are dropped and listed in the result's `ignored_terms`.
 
 Search, draft lists and Drive lists/searches honor `max_results`, fill short API
