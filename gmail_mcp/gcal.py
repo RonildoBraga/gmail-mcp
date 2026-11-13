@@ -7,6 +7,8 @@ converts in both directions and callers never see the exclusive form.
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -111,6 +113,17 @@ def _required_zone(zone: str | None) -> ZoneInfo:
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def list_params(time_min: str | None, time_max: str | None, query: str | None,
+                zone: str | None) -> dict:
+    """events.list filters for a new listing; time_min defaults to now."""
+    params = {"timeMin": bound(time_min, zone) if time_min else now()}
+    if time_max:
+        params["timeMax"] = bound(time_max, zone, end=True)
+    if query:
+        params["q"] = query
+    return params
 
 
 def event_times(start: str, end: str, zone: str | None, *, clear_other: bool = False) -> tuple[dict, dict]:
@@ -253,6 +266,39 @@ def list_events(svc, calendar_id: str, max_results: int, page_token: str | None 
         "events": [simplify(e, max_description=LIST_DESCRIPTION_CHARS, link=False) for e in events],
         "next_page_token": token,
     }
+
+
+_LIST_PARAMS = frozenset({"timeMin", "timeMax", "q"})
+
+
+def continuation(listing: dict, params: dict, page_token: str | None) -> str | None:
+    """Wrap Google's page token with the filters its listing resolved.
+
+    Google expects every page of a listing to send the same filters, and a time_min
+    that defaulted to now would otherwise move on each call.
+    """
+    if not page_token:
+        return None
+    cursor = {"listing": listing, "params": params, "page_token": page_token}
+    return base64.urlsafe_b64encode(json.dumps(cursor).encode()).decode()
+
+
+def resume(page_token: str, listing: dict) -> tuple[dict, str]:
+    """The filters and Google page token a continuation saved, for the same listing only."""
+    try:
+        cursor = json.loads(base64.urlsafe_b64decode(page_token.encode()).decode())
+        saved, params, token = cursor["listing"], cursor["params"], cursor["page_token"]
+        if (not isinstance(saved, dict) or not isinstance(params, dict) or not isinstance(token, str)
+                or "timeMin" not in params or not set(params) <= _LIST_PARAMS
+                or not all(isinstance(value, str) for value in params.values())):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+        raise ValueError("page_token must be a next_page_token from calendar_list_events.") from exc
+    changed = [name for name in listing if saved.get(name) != listing[name]]
+    if changed:
+        raise ValueError(f"page_token came from a call with different {', '.join(changed)}. "
+                         "Repeat that call's arguments and add page_token.")
+    return params, token
 
 
 def get_event(svc, calendar_id: str, event_id: str) -> dict:

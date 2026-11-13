@@ -268,21 +268,81 @@ class CalendarToolTests(unittest.TestCase):
     def test_listing_defaults_to_now(self):
         service, svc = self.service()
         with service as service_for, patch.object(server.gcal, "now", return_value="NOW"), \
-             patch.object(server.gcal, "list_events", return_value={"events": []}) as list_events:
-            server.calendar_list_events()
+             patch.object(server.gcal, "list_events",
+                          return_value={"events": [], "next_page_token": None}) as list_events:
+            result = server.calendar_list_events()
         service_for.assert_called_once_with(None, gcal.READ_EVENTS)
         list_events.assert_called_once_with(svc, "primary", 25, None, timeMin="NOW")
+        self.assertEqual((result["time_min"], result["time_max"]), ("NOW", None))
 
     def test_listing_whole_days_uses_the_calendars_zone(self):
         service, svc = self.service()
         with service as service_for, \
              patch.object(server.gcal, "calendar_time_zone", return_value="Asia/Tokyo"), \
-             patch.object(server.gcal, "list_events", return_value={"events": []}) as list_events:
+             patch.object(server.gcal, "list_events",
+                          return_value={"events": [], "next_page_token": None}) as list_events:
             server.calendar_list_events(time_min="2027-03-08", time_max="2027-03-08", query="lunch")
         service_for.assert_called_once_with(None, gcal.READ_EVENTS, gcal.READ_CALENDARS)
         params = list_events.call_args.kwargs
         self.assertEqual(params, {"timeMin": "2027-03-08T00:00:00+09:00",
                                   "timeMax": "2027-03-09T00:00:00+09:00", "q": "lunch"})
+
+    def test_the_next_page_keeps_the_first_pages_bounds(self):
+        svc = Mock()
+        svc.events.return_value.list.return_value.execute.side_effect = [
+            {"items": [all_day("1")], "nextPageToken": "two"}, {"items": [all_day("2")]}]
+        with patch.object(server.gcal, "service_for", return_value=("a@example.com", svc)):
+            with patch.object(server.gcal, "now", return_value="2027-03-01T09:00:00+00:00"):
+                first = server.calendar_list_events(max_results=1)
+            with patch.object(server.gcal, "now", return_value="2027-03-01T09:05:00+00:00"):
+                second = server.calendar_list_events(max_results=1, page_token=first["next_page_token"])
+        self.assertNotEqual(first["next_page_token"], "two")
+        later = svc.events.return_value.list.call_args_list[1].kwargs
+        self.assertEqual((later["pageToken"], later["timeMin"]), ("two", "2027-03-01T09:00:00+00:00"))
+        self.assertEqual((second["time_min"], second["events"][0]["id"], second["next_page_token"]),
+                         ("2027-03-01T09:00:00+00:00", "2", None))
+
+    def test_the_next_page_reuses_resolved_bounds_without_a_zone_lookup(self):
+        svc = Mock()
+        svc.events.return_value.list.return_value.execute.side_effect = [
+            {"items": [all_day("1")], "nextPageToken": "two"}, {"items": [all_day("2")]}]
+        listing = {"time_min": "2027-03-08", "time_max": "2027-03-12", "max_results": 1}
+        with patch.object(server.gcal, "service_for", return_value=("a@example.com", svc)) as service_for, \
+             patch.object(server.gcal, "calendar_time_zone", return_value="Asia/Tokyo") as zone:
+            first = server.calendar_list_events(**listing)
+            server.calendar_list_events(**listing, page_token=first["next_page_token"])
+        zone.assert_called_once_with(svc, "primary")
+        self.assertEqual(service_for.call_args_list[1].args, (None, gcal.READ_EVENTS))
+        bounds = ("2027-03-08T00:00:00+09:00", "2027-03-13T00:00:00+09:00")
+        later = svc.events.return_value.list.call_args_list[1].kwargs
+        self.assertEqual((later["timeMin"], later["timeMax"]), bounds)
+        self.assertEqual((first["time_min"], first["time_max"]), bounds)
+
+    def test_a_page_token_only_continues_its_own_listing(self):
+        svc = Mock()
+        svc.events.return_value.list.return_value.execute.return_value = {
+            "items": [all_day()], "nextPageToken": "two"}
+
+        def as_account(email):
+            return patch.object(server.gcal, "service_for", return_value=(email, svc))
+
+        listing = {"time_max": "2027-03-31", "time_zone": "Asia/Tokyo", "max_results": 1}
+        with as_account("a@example.com"):
+            token = server.calendar_list_events(**listing)["next_page_token"]
+        forged = gcal.continuation({"account": "a@example.com"}, {"timeMin": "x", "pageToken": "y"}, "two")
+        cases = [
+            ("a@example.com", {"time_max": "2027-04-30"}, "different time_max"),
+            ("a@example.com", {"calendar_id": "team@example.com"}, "different calendar_id"),
+            ("a@example.com", {"query": "lunch"}, "different query"),
+            ("b@example.com", {}, "different account"),
+            ("a@example.com", {"page_token": "not-a-token"}, "next_page_token from"),
+            ("a@example.com", {"page_token": forged}, "next_page_token from"),
+        ]
+        for email, changes, message in cases:
+            with self.subTest(changes=changes, email=email), as_account(email):
+                with self.assertRaisesRegex(ValueError, message):
+                    server.calendar_list_events(**{**listing, "page_token": token, **changes})
+        self.assertEqual(svc.events.return_value.list.call_count, 1)
 
     def test_getting_an_event_returns_its_link(self):
         service, _ = self.service(all_day(htmlLink="https://example.com/e1"))

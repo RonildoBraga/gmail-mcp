@@ -149,10 +149,11 @@ all work, and quoted phrases are safe. `in:inbox` limits a search to the inbox, 
 on its own lists the inbox newest first. Operators with no Graph equivalent, such as
 `label:` and `category:`, are dropped and listed in the result's `ignored_terms`.
 
-Search, draft lists and Drive lists/searches honor `max_results`, fill short API
-pages, and return `next_page_token` (`null` when finished). Pass it back as
-`page_token` with the same account and query. Graph cursors may contain buffered
-message summaries: treat them as mailbox data, not secrets or portable bookmarks.
+Search, draft lists, Drive lists/searches and calendar event lists honor
+`max_results`, fill short API pages, and return `next_page_token` (`null` when
+finished). Pass it back as `page_token`, repeating the call's other arguments.
+Graph cursors may contain buffered message summaries: treat them as mailbox data,
+not secrets or portable bookmarks.
 `search_all_threads` returns `next_page_tokens` by account; continue each account
 through `search_threads`. Graph conversations and folder enumeration follow every
 page and detect loops. Moving a Graph conversation enumerates all message IDs
@@ -174,7 +175,10 @@ themselves.
   account's own calendar.
 - `calendar_list_events` lists events in start order, with repeating events
   expanded. `time_min` and `time_max` take a date, which covers that whole day,
-  or a time. `time_min` defaults to now, and `query` searches event text.
+  or a time. `time_min` defaults to now, and `query` searches event text. The
+  result gives the `time_min` and `time_max` it used, and `next_page_token` keeps
+  them, so later pages stay in the same window even when `time_min` defaulted to
+  now.
 - `calendar_create_event` and `calendar_update_event` take dates for all-day
   events and times for the rest. An all-day `end` is the event's last day, so
   `2027-03-01` to `2027-03-03` is three days and a one-day event has the same
