@@ -37,6 +37,7 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(result["capabilities"]["outlook_inbox_rules"])
         self.assertFalse(result["capabilities"]["gmail_filters"])
         self.assertFalse(result["capabilities"]["drive"])
+        self.assertFalse(result["capabilities"]["calendar"])
         self.assertEqual(result["stored_scopes"], ["Mail.Read"])
 
     def test_cross_account_search_reports_errors_and_continuations(self):
@@ -53,9 +54,11 @@ class ServerTests(unittest.TestCase):
 
     def test_read_and_destructive_tool_annotations(self):
         tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-        for name in ("get_account_capabilities", "list_filters", "get_inbox_rule", "drive_read"):
+        for name in ("get_account_capabilities", "list_filters", "get_inbox_rule", "drive_read",
+                     "calendar_list_calendars", "calendar_list_events", "calendar_get_event"):
             self.assertTrue(tools[name].annotations.readOnlyHint, name)
-        for name in ("create_filter", "delete_filter", "replace_filter", "update_inbox_rule", "delete_inbox_rule"):
+        for name in ("create_filter", "delete_filter", "replace_filter", "update_inbox_rule", "delete_inbox_rule",
+                     "calendar_create_event", "calendar_update_event", "calendar_delete_event"):
             self.assertFalse(tools[name].annotations.readOnlyHint, name)
             self.assertTrue(tools[name].annotations.destructiveHint, name)
         self.assertTrue(tools["create_filter"].inputSchema["properties"]["dry_run"]["default"])
