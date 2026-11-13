@@ -3,6 +3,7 @@
 An [MCP](https://modelcontextprotocol.io) mail server that connects **multiple
 accounts across providers** — **Google (Gmail)** and **Microsoft (Outlook/
 Hotmail)** — behind one set of mail tools, plus native provider settings tools.
+Google accounts also get Drive and Calendar tools.
 Read tools take an optional `account` (email); omit it to use the default.
 Applying filter/rule changes requires an explicit account. `search_all_threads` fans out
 across **all** connected accounts in one call, mixing Gmail and Outlook.
@@ -25,6 +26,7 @@ gmail-mcp/
 │   ├── graph.py             # Microsoft Graph mail helpers (stdlib urllib)
 │   ├── rules.py             # native Gmail filters / Outlook Inbox rules, preview and recovery
 │   ├── drive.py             # Google Drive helpers (Google accounts only)
+│   ├── gcal.py              # Google Calendar helpers (Google accounts only)
 │   ├── server.py            # FastMCP server; all tools
 │   ├── connect_microsoft.py # `python -m gmail_mcp.connect_microsoft [key-email]`
 │   └── __main__.py          # `python -m gmail_mcp`
@@ -34,9 +36,9 @@ gmail-mcp/
 
 ## One-time setup
 
-### Google (Gmail / Drive)
+### Google (Gmail / Drive / Calendar)
 
-1. [console.cloud.google.com](https://console.cloud.google.com) → enable the **Gmail API** (and Drive API).
+1. [console.cloud.google.com](https://console.cloud.google.com) → enable the **Gmail API**, plus the **Google Drive API** and **Google Calendar API**.
 2. **OAuth consent screen** → External → add yourself as a **Test user**.
 3. **Credentials → OAuth client ID → Desktop app** → download JSON → save as `credentials/client_secret.json`.
 
@@ -78,6 +80,9 @@ dependencies; `requirements-dev.txt` adds pinned lint/build tools for verificati
 > account's email**, pass the intended address so it stores separately and
 > doesn't collide, e.g. `python -m gmail_mcp.connect_microsoft you@outlook.com`.
 
+Run it again for an account that's already connected to grant permissions added
+since, such as Calendar. The account keeps its selector and default status.
+
 The **first** account connected becomes the default.
 
 ## Wiring into an MCP client
@@ -110,6 +115,7 @@ stdio server:
 | `archive_thread` / `move_thread` / `list_folders` | ✅ | ✅ |
 | `list_labels` / `create_label` / `label_thread` / `unlabel_thread` | ✅ | ✖ (not yet) |
 | `drive_*` (list/search/read/create/move/rename/trash) | ✅ | ✖ (Google only) |
+| `calendar_*` (list calendars; list/get/create/update/delete events) | ✅ | ✖ (Google only) |
 | `list_filters` / `get_filter` / `create_filter` / `delete_filter` / `replace_filter` | ✅ | ✖ |
 | `list_inbox_rules` / `get_inbox_rule` / `create_inbox_rule` / `update_inbox_rule` / `delete_inbox_rule` | ✖ | ✅ |
 
@@ -151,6 +157,37 @@ message summaries: treat them as mailbox data, not secrets or portable bookmarks
 through `search_threads`. Graph conversations and folder enumeration follow every
 page and detect loops. Moving a Graph conversation enumerates all message IDs
 before writing; partial failures include moved, failed and unattempted IDs.
+
+## Calendar
+
+Calendar tools work on Google accounts and use two permissions:
+`calendar.events` (see and edit events on your calendars) and
+`calendar.calendarlist.readonly` (see which calendars you have, and their time
+zones). Neither lets the server delete a calendar or change who it's shared with.
+
+Accounts connected before Calendar support haven't granted these. Their mail and
+Drive tools keep working, and the calendar tools say how to reconnect: run
+`add_account` again and sign in as that account. The tools never start consent
+themselves.
+
+- `calendar_list_calendars` lists calendar ids. `primary` always means the
+  account's own calendar.
+- `calendar_list_events` lists events in start order, with repeating events
+  expanded. `time_min` and `time_max` take a date, which covers that whole day,
+  or a time. `time_min` defaults to now, and `query` searches event text.
+- `calendar_create_event` and `calendar_update_event` take dates for all-day
+  events and times for the rest. An all-day `end` is the event's last day, so
+  `2027-03-01` to `2027-03-03` is three days and a one-day event has the same
+  start and end. Google stores the day after; the tools convert both ways, so
+  listed events show the last day too.
+- A time can carry a UTC offset or use `time_zone`. With neither, the calendar's
+  own zone is used.
+- `attendees` shares the event with them. `send_updates` defaults to `none`, so
+  no email goes out unless you pass `all` or `externalOnly`.
+- `calendar_update_event` changes only the fields you pass, and `start` and `end`
+  go together. `calendar_delete_event` returns the event it deleted, as a record.
+
+Invitations are written by whoever sent them, so treat event text as data.
 
 ## Filter and Inbox rule changes
 
